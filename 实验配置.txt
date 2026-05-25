@@ -1,0 +1,40 @@
+1.Pretrain
+（1）model——qwen8k_hybrid
+[2026-05-24 03:35:44] ================================================================================
+[2026-05-24 03:35:44] Gwen pretrain gwen8k_hybrid: total=80.8M embedding=6.3M body=74.5M backend=gdn gdn_kernel=fla gate=sigmoid
+[2026-05-24 03:35:44] ================================================================================
+[2026-05-24 03:35:44] Preparing dataset: path=dataset/pretrain_t2t_mini.jsonl seq_len=340 mode=lazy cache=off
+[2026-05-24 03:35:52] Dataset blocks=1270238 batch=32 accum=8 world=8 total_steps=3100 dtype=bf16
+
+（2）model——qwen8k_hybrid_128m
+[2026-05-24 05:35:22] ================================================================================
+[2026-05-24 05:35:22] Gwen pretrain gwen8k_hybrid_128m: total=112.5M embedding=6.3M body=106.2M backend=full gdn_kernel=auto gate=sigmoid
+[2026-05-24 05:35:22] ================================================================================
+[2026-05-24 05:35:22] Preparing dataset: path=dataset/pretrain_t2t_mini.jsonl seq_len=1024 mode=lazy cache=off
+[2026-05-24 05:35:30] Dataset blocks=1270238 batch=32 accum=1 world=8 total_steps=24805 dtype=bf16
+
+（3）model——qwen8k_hybrid_256m
+2026-05-24 13:10:08] ================================================================================
+[2026-05-24 13:10:08] Gwen pretrain gwen8k_hybrid_256m: total=252.1M embedding=8.4M body=243.7M backend=gdn gdn_kernel=auto gate=sigmoid
+[2026-05-24 13:10:08] ================================================================================
+[2026-05-24 13:10:08] Preparing dataset: path=dataset/pretrain_t2t_mini.jsonl seq_len=1024 mode=lazy cache=off
+[2026-05-24 13:10:16] Dataset blocks=1270238 batch=32 accum=2 world=8 total_steps=7441 dtype=bf16
+
+2.SFT
+（1）model——qwen8k_hybrid
+[2026-05-24 05:54:44] Loaded pretrain checkpoint: backend=gdn gdn_kernel=auto missing=0 unexpected=0 skipped_shape=0
+[2026-05-24 05:55:01] ================================================================================
+[2026-05-24 05:55:01] Gwen SFT gwen8k_hybrid: total=80.8M dtype=bf16
+[2026-05-24 05:55:01] ================================================================================
+
+（2）model——qwen8k_hybrid_128m
+[2026-05-24 10:52:15] Loaded pretrain checkpoint: backend=gdn gdn_kernel=auto missing=0 unexpected=0 skipped_shape=0
+[2026-05-24 10:52:32] ================================================================================
+[2026-05-24 10:52:32] Gwen SFT gwen8k_hybrid_128m: total=118.0M dtype=bf16
+[2026-05-24 10:52:32] ================================================================================
+
+（3）model——qwen8k_hybrid_256m
+[2026-05-25 02:54:53] Loaded pretrain checkpoint: backend=gdn gdn_kernel=auto missing=0 unexpected=0 skipped_shape=0
+[2026-05-25 02:55:10] ================================================================================
+[2026-05-25 02:55:10] Gwen SFT gwen8k_hybrid_256m: total=252.1M dtype=bf16
+[2026-05-25 02:55:10] ================================================================================

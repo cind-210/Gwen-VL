@@ -1,0 +1,28 @@
+{
+  "bos_token": "<|im_start|>",
+  "eos_token": "<|im_end|>",
+  "unk_token": "<|endoftext|>",
+  "pad_token": "<|endoftext|>",
+  "additional_special_tokens": [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|object_ref_start|>",
+    "<|object_ref_end|>",
+    "<|box_start|>",
+    "<|box_end|>",
+    "<|quad_start|>",
+    "<|quad_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+    "<|audio_start|>",
+    "<|audio_end|>",
+    "<|audio_pad|>",
+    "<tts_pad>",
+    "<tts_text_bos>",
+    "<tts_text_eod>",
+    "<tts_text_bos_single>"
+  ]
+}
