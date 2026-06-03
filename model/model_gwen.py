@@ -3,7 +3,7 @@ GWen text-only language model.
 
 The model is a compact, readable PyTorch implementation of the Qwen3.5 text
 backbone ideas: 3 linear-attention blocks followed by 1 full-attention block,
-Partial RoPE, QK-Norm, SwiGLU, and tied token embeddings.
+3D M-RoPE on full-attention layers, QK-Norm, SwiGLU, and tied token embeddings.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import asdict, dataclass
 from inspect import signature
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,10 +37,10 @@ except Exception:
 
 @dataclass
 class GWenConfig:
-    vocab_size: int = 248320
-    hidden_size: int = 384
-    num_hidden_layers: int = 8
-    intermediate_size: int = 1280
+    vocab_size: int = 8192
+    hidden_size: int = 1024
+    num_hidden_layers: int = 24
+    intermediate_size: int = 3584
     hidden_act: str = "silu"
     max_position_embeddings: int = 8192
     rms_norm_eps: float = 1e-6
@@ -48,17 +48,17 @@ class GWenConfig:
     tie_word_embeddings: bool = True
     initializer_range: float = 0.02
 
-    num_attention_heads: int = 4
+    num_attention_heads: int = 8
     num_key_value_heads: int = 2
-    head_dim: int = 96
+    head_dim: int = 256
     attention_bias: bool = False
     attn_output_gate: bool = True
     gated_attention: str = "sigmoid"  # none, sigmoid, headwise, elementwise
 
-    linear_num_key_heads: int = 6
-    linear_num_value_heads: int = 6
-    linear_key_head_dim: int = 64
-    linear_value_head_dim: int = 64
+    linear_num_key_heads: int = 16
+    linear_num_value_heads: int = 16
+    linear_key_head_dim: int = 128
+    linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
     linear_chunk_size: int = 64
     linear_attention_backend: str = "gdn"
@@ -68,6 +68,15 @@ class GWenConfig:
     rope_theta: float = 10_000_000.0
     partial_rotary_factor: float = 0.25
     use_cache: bool = True
+
+    vision_model_name: str = "gongjy/siglip2-base-p32-256-ve"
+    image_token_id: int = -1
+    vision_start_token_id: int = -1
+    vision_end_token_id: int = -1
+    image_size: int = 256
+    vision_patch_size: int = 32
+    image_grid_size: int = 8
+    vision_hidden_size: int = 768
 
     def __post_init__(self) -> None:
         self.validate()
@@ -107,9 +116,11 @@ class GWenConfig:
         if self.linear_key_head_dim != self.linear_value_head_dim:
             raise ValueError("GWen expects equal linear key/value head dims for gated delta recurrence")
         if int(self.head_dim * self.partial_rotary_factor) % 2 != 0:
-            raise ValueError("full attention rotary dim must be even")
-        if int(self.linear_key_head_dim * self.partial_rotary_factor) % 2 != 0:
-            raise ValueError("linear attention rotary dim must be even")
+            raise ValueError("full attention rotary dim must be even for M-RoPE")
+        if int(self.head_dim * self.partial_rotary_factor) < 6:
+            raise ValueError("full attention rotary dim must provide at least one pair for each M-RoPE axis")
+        if self.image_grid_size != self.image_size // self.vision_patch_size:
+            raise ValueError("image_grid_size must equal image_size // vision_patch_size")
         if self.gated_attention not in {"none", "sigmoid", "headwise", "elementwise"}:
             raise ValueError("gated_attention must be one of: none, sigmoid, headwise, elementwise")
         if self.linear_attention_backend not in {"gdn", "full"}:
@@ -128,41 +139,14 @@ class GWenConfig:
     def gwen8k_hybrid(cls) -> "GWenConfig":
         return cls(
             vocab_size=8192,
-            hidden_size=768,
-            num_hidden_layers=8,
-            intermediate_size=2816,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            head_dim=96,
-            linear_num_key_heads=8,
-            linear_num_value_heads=8,
-            linear_key_head_dim=96,
-            linear_value_head_dim=96,
-            full_attention_interval=4,
-            attn_output_gate=True,
-            gated_attention="sigmoid",
-            linear_attention_backend="gdn",
-            max_position_embeddings=8192,
-        )
-
-    @classmethod
-    def gwen8k_hybrid_128m(cls) -> "GWenConfig":
-        config = cls.gwen8k_hybrid()
-        config.num_hidden_layers = 12
-        return config
-
-    @classmethod
-    def gwen8k_hybrid_256m(cls) -> "GWenConfig":
-        return cls(
-            vocab_size=8192,
             hidden_size=1024,
-            num_hidden_layers=16,
-            intermediate_size=3328,
+            num_hidden_layers=24,
+            intermediate_size=3584,
             num_attention_heads=8,
-            num_key_value_heads=4,
-            head_dim=128,
-            linear_num_key_heads=8,
-            linear_num_value_heads=8,
+            num_key_value_heads=2,
+            head_dim=256,
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             full_attention_interval=4,
@@ -174,8 +158,6 @@ class GWenConfig:
 
 CONFIG_PRESETS = {
     "gwen8k_hybrid": GWenConfig.gwen8k_hybrid,
-    "gwen8k_hybrid_128m": GWenConfig.gwen8k_hybrid_128m,
-    "gwen8k_hybrid_256m": GWenConfig.gwen8k_hybrid_256m,
 }
 
 
@@ -205,22 +187,50 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
+def split_mrope_sections(pair_count: int) -> Tuple[int, int, int]:
+    base = pair_count // 3
+    remainder = pair_count % 3
+    return base + (1 if remainder > 0 else 0), base + (1 if remainder > 1 else 0), base
+
+
+def apply_axis_rotary(
+    x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    rotary_dim: int, # 对 q, k 进行 rotary pos emb，其默认至为0.25，即对 head_dim 的前 1/4 维度进行旋转位置编码，剩余维度保持不变。这种部分旋转的位置编码方法可以在保持模型性能的同时，减少计算开销和内存使用，特别是在 head_dim 较大的情况下。
+    pair_count: int,
+) -> torch.Tensor:
+    cos = cos[..., :pair_count].repeat_interleave(2, dim=-1).unsqueeze(2)
+    sin = sin[..., :pair_count].repeat_interleave(2, dim=-1).unsqueeze(2)
+    return x.float() * cos + rotate_half(x.float()) * sin
+
+
+def apply_3d_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_t: torch.Tensor,
+    sin_t: torch.Tensor,
+    cos_h: torch.Tensor,
+    sin_h: torch.Tensor,
+    cos_w: torch.Tensor,
+    sin_w: torch.Tensor,
+    mrope_sections: Tuple[int, int, int],
+    rotary_dim: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if rotary_dim <= 0:
         return q, k
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    cos = cos[..., : rotary_dim // 2].repeat_interleave(2, dim=-1).unsqueeze(2)
-    sin = sin[..., : rotary_dim // 2].repeat_interleave(2, dim=-1).unsqueeze(2)
-    q_rot = (q_rot.float() * cos + rotate_half(q_rot.float()) * sin).to(q.dtype)
-    k_rot = (k_rot.float() * cos + rotate_half(k_rot.float()) * sin).to(k.dtype)
-    return torch.cat((q_rot, q_pass), dim=-1), torch.cat((k_rot, k_pass), dim=-1)
+    t_pairs, h_pairs, w_pairs = mrope_sections
+    q_t, q_h, q_w = torch.split(q_rot, [2 * t_pairs, 2 * h_pairs, 2 * w_pairs], dim=-1)
+    k_t, k_h, k_w = torch.split(k_rot, [2 * t_pairs, 2 * h_pairs, 2 * w_pairs], dim=-1)
+
+    q_t = apply_axis_rotary(q_t, cos_t, sin_t, t_pairs).to(q.dtype)
+    k_t = apply_axis_rotary(k_t, cos_t, sin_t, t_pairs).to(k.dtype)
+    q_h = apply_axis_rotary(q_h, cos_h, sin_h, h_pairs).to(q.dtype)
+    k_h = apply_axis_rotary(k_h, cos_h, sin_h, h_pairs).to(k.dtype)
+    q_w = apply_axis_rotary(q_w, cos_w, sin_w, w_pairs).to(q.dtype)
+    k_w = apply_axis_rotary(k_w, cos_w, sin_w, w_pairs).to(k.dtype)
+    return torch.cat((q_t, q_h, q_w, q_pass), dim=-1), torch.cat((k_t, k_h, k_w, k_pass), dim=-1)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -265,6 +275,7 @@ class FullAttention(nn.Module):
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_key_value_groups
         self.rotary_dim = int(config.head_dim * config.partial_rotary_factor) 
+        self.mrope_sections = split_mrope_sections(self.rotary_dim // 2)
 
         self.q_proj = nn.Linear(config.hidden_size, config.full_attention_q_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, config.full_attention_kv_dim, bias=config.attention_bias)
@@ -284,7 +295,7 @@ class FullAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Dict[str, torch.Tensor]] = None,
         use_cache: bool = False,
@@ -296,8 +307,8 @@ class FullAttention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, self.rotary_dim)
+        cos_t, sin_t, cos_h, sin_h, cos_w, sin_w = position_embeddings
+        q, k = apply_3d_rotary_pos_emb(q, k, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w, self.mrope_sections, self.rotary_dim)
 
         if past_key_value is not None:
             k = torch.cat([past_key_value["key"].to(k.dtype), k], dim=1)
@@ -361,7 +372,6 @@ class GatedDeltaNet(nn.Module):
         self.head_dim = config.linear_key_head_dim
         self.value_dim = config.linear_value_head_dim
         self.qkv_dim = self.num_heads * self.head_dim
-        self.rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         channels = 3 * self.qkv_dim
 
         self.in_proj_qkv = nn.Linear(config.hidden_size, channels, bias=config.attention_bias)
@@ -509,7 +519,7 @@ class GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Dict[str, torch.Tensor]] = None,
         use_cache: bool = False,
@@ -527,8 +537,6 @@ class GatedDeltaNet(nn.Module):
         v = v.view(batch, seq_len, self.num_heads, self.value_dim)
         z = self.in_proj_z(hidden_states).view(batch, seq_len, self.num_heads, self.value_dim)
 
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, self.rotary_dim)
         q = F.normalize(q.float(), p=2, dim=-1).to(hidden_states.dtype)
         k = F.normalize(k.float(), p=2, dim=-1).to(hidden_states.dtype)
 
@@ -588,7 +596,7 @@ class GWenDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Dict[str, torch.Tensor]] = None,
         use_cache: bool = False,
@@ -616,22 +624,26 @@ class GWenModel(nn.Module):
         self.layers = nn.ModuleList([GWenDecoderLayer(config, kind) for kind in config.layer_types])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         fa_rotary = int(config.head_dim * config.partial_rotary_factor)
-        la_rotary = int(config.linear_key_head_dim * config.partial_rotary_factor)
-        max_rotary = max(fa_rotary, la_rotary)
-        cos, sin = precompute_freqs_cis(max_rotary, config.max_position_embeddings, config.rope_theta)
+        max_axis_pairs = max(split_mrope_sections(fa_rotary // 2))
+        cos, sin = precompute_freqs_cis(2 * max_axis_pairs, config.max_position_embeddings, config.rope_theta)
         self.register_buffer("freqs_cos", cos, persistent=False)
         self.register_buffer("freqs_sin", sin, persistent=False)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[Optional[Dict[str, torch.Tensor]]]]]:
-        batch, seq_len = input_ids.shape
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("input_ids or inputs_embeds must be provided")
+            inputs_embeds = self.embed_tokens(input_ids)
+        batch, seq_len, _ = inputs_embeds.shape
+        hidden_states = self.dropout(inputs_embeds)
         if position_ids is None:
             past_len = 0
             if past_key_values:
@@ -639,17 +651,23 @@ class GWenModel(nn.Module):
                     if item is not None and "key" in item:
                         past_len = item["key"].shape[1]
                         break
-            position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device)
+            position_ids = torch.arange(past_len, past_len + seq_len, device=hidden_states.device)
             position_ids = position_ids.unsqueeze(0).expand(batch, -1)
-        cos = self.freqs_cos[position_ids].to(hidden_states.device)
-        sin = self.freqs_sin[position_ids].to(hidden_states.device)
+        if position_ids.dim() == 2:
+            position_ids = torch.stack((position_ids, position_ids, position_ids), dim=-1)
+        cos_t = self.freqs_cos[position_ids[..., 0]].to(hidden_states.device)
+        sin_t = self.freqs_sin[position_ids[..., 0]].to(hidden_states.device)
+        cos_h = self.freqs_cos[position_ids[..., 1]].to(hidden_states.device)
+        sin_h = self.freqs_sin[position_ids[..., 1]].to(hidden_states.device)
+        cos_w = self.freqs_cos[position_ids[..., 2]].to(hidden_states.device)
+        sin_w = self.freqs_sin[position_ids[..., 2]].to(hidden_states.device)
         presents = [] if use_cache else None
 
         for idx, layer in enumerate(self.layers):
             past = past_key_values[idx] if past_key_values is not None else None
             hidden_states, present = layer(
                 hidden_states,
-                (cos, sin),
+                (cos_t, sin_t, cos_h, sin_h, cos_w, sin_w),
                 attention_mask=attention_mask,
                 past_key_value=past,
                 use_cache=use_cache,
@@ -661,7 +679,7 @@ class GWenModel(nn.Module):
 
 
 class GWenForCausalLM(nn.Module):
-    def __init__(self, config: Optional[GWenConfig] = None):
+    def __init__(self, config: Optional[GWenConfig] = None, vision_model_path: Optional[str] = None):
         super().__init__()
         self.config = config or GWenConfig.gwen8k_hybrid()
         self.model = GWenModel(self.config)
@@ -672,6 +690,11 @@ class GWenForCausalLM(nn.Module):
         self.apply(self._init_weights)
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
+        self.visual = None
+        self.vision_projector = None
+        self.vision_model_path = vision_model_path or ""
+        if vision_model_path is not None:
+            self.load_vision_model(vision_model_path)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -686,16 +709,23 @@ class GWenForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None,
         use_cache: bool = False,
         logits_to_keep: int = 0,
         **_: Dict,
     ) -> Dict[str, torch.Tensor]:
+        if pixel_values is not None:
+            inputs_embeds = self.prepare_inputs_embeds(input_ids, pixel_values)
+        if position_ids is None:
+            position_ids = self.build_3d_position_ids(input_ids, past_key_values=past_key_values)
         hidden_states, presents = self.model(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -722,11 +752,113 @@ class GWenForCausalLM(nn.Module):
             "hidden_states": hidden_states,
         }
 
+    def load_vision_model(self, vision_model_path: Optional[str] = None) -> None:
+        from transformers import SiglipVisionModel
+
+        self.vision_model_path = vision_model_path or self.config.vision_model_name
+        if not self.vision_model_path:
+            raise ValueError("vision_model_path or config.vision_model_name must be provided")
+        self.visual = SiglipVisionModel.from_pretrained(self.vision_model_path)
+        for param in self.visual.parameters():
+            param.requires_grad = False
+        self.config.vision_hidden_size = int(self.visual.config.hidden_size)
+        self.vision_projector = GWenVisionProjector(self.config.vision_hidden_size, self.config.hidden_size)
+        self.vision_projector.apply(self._init_weights)
+
+    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        if self.visual is None or self.vision_projector is None:
+            raise ValueError("Vision model is not loaded; pass vision_model_path when constructing GWenForCausalLM")
+        self.visual.eval()
+        with torch.no_grad():
+            image_hidden = self.visual(pixel_values=pixel_values).last_hidden_state
+        expected_tokens = self.config.image_grid_size * self.config.image_grid_size
+        if image_hidden.shape[1] != expected_tokens:
+            raise ValueError(f"SigLIP2 returned {image_hidden.shape[1]} tokens, expected {expected_tokens}")
+        return self.vision_projector(image_hidden)
+
+    def build_3d_position_ids(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None,
+        rope_deltas: Optional[torch.Tensor] = None,
+        return_rope_deltas: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        batch, seq_len = input_ids.shape
+        past_len = 0
+        if past_key_values:
+            for item in past_key_values:
+                if item is not None and "key" in item:
+                    past_len = item["key"].shape[1]
+                    break
+        if past_len > 0:
+            delta = 0 if rope_deltas is None else rope_deltas.to(input_ids.device).view(batch, 1)
+            text_pos = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
+            position_ids = text_pos.expand(batch, -1) + delta
+            position_ids = torch.stack((position_ids, position_ids, position_ids), dim=-1)
+            if return_rope_deltas:
+                return position_ids, delta.squeeze(1)
+            return position_ids
+
+        text_pos = torch.arange(seq_len, device=input_ids.device)
+        position_ids = torch.stack((text_pos, text_pos, text_pos), dim=-1).unsqueeze(0).expand(batch, -1, -1).clone()
+        if self.config.image_token_id < 0:
+            if return_rope_deltas:
+                return position_ids, torch.zeros(batch, dtype=torch.long, device=input_ids.device)
+            return position_ids
+
+        image_mask = input_ids.eq(self.config.image_token_id)
+        grid = self.config.image_grid_size
+        row = torch.arange(grid, device=input_ids.device).repeat_interleave(grid)
+        col = torch.arange(grid, device=input_ids.device).repeat(grid)
+        temporal = torch.zeros_like(row)
+        image_pos = torch.stack((temporal, row, col), dim=-1)
+        expected_tokens = grid * grid
+        deltas = torch.zeros(batch, dtype=torch.long, device=input_ids.device)
+        for batch_idx in range(batch):
+            indexes = torch.nonzero(image_mask[batch_idx], as_tuple=False).squeeze(-1)
+            if indexes.numel() == 0:
+                continue
+            if indexes.numel() != expected_tokens:
+                raise ValueError(f"Each image sample must contain {expected_tokens} <|image_pad|> tokens")
+            if not torch.all(indexes.eq(torch.arange(indexes[0], indexes[0] + expected_tokens, device=input_ids.device))):
+                raise ValueError("<|image_pad|> tokens must form one contiguous image block")
+
+            image_start = int(indexes[0].item())
+            current_pos = image_start
+            position_ids[batch_idx, indexes] = image_pos + current_pos
+            after_image = image_start + expected_tokens
+            text_after = seq_len - after_image
+            if text_after > 0:
+                next_pos = current_pos + grid
+                tail_pos = torch.arange(next_pos, next_pos + text_after, device=input_ids.device)
+                position_ids[batch_idx, after_image:] = torch.stack((tail_pos, tail_pos, tail_pos), dim=-1)
+            deltas[batch_idx] = int(position_ids[batch_idx].max().item()) + 1 - seq_len
+        if return_rope_deltas:
+            return position_ids, deltas
+        return position_ids
+
+    def prepare_inputs_embeds(self, input_ids: torch.Tensor, pixel_values: Optional[torch.Tensor]) -> torch.Tensor:
+        inputs_embeds = self.model.embed_tokens(input_ids)
+        if pixel_values is None:
+            return inputs_embeds
+        if self.config.image_token_id < 0:
+            raise ValueError("config.image_token_id must be set before VLM forward")
+        image_features = self.get_image_features(pixel_values).to(inputs_embeds.dtype)
+        image_mask = input_ids.eq(self.config.image_token_id)
+        expected_tokens = image_features.shape[1]
+        token_counts = image_mask.sum(dim=1)
+        if not torch.all(token_counts.eq(expected_tokens)):
+            raise ValueError(f"Each sample must contain exactly {expected_tokens} <|image_pad|> tokens")
+        inputs_embeds = inputs_embeds.clone()
+        inputs_embeds[image_mask] = image_features.reshape(-1, image_features.shape[-1])
+        return inputs_embeds
+
     @torch.inference_mode()
     def generate(
         self,
         input_ids: Optional[torch.Tensor] = None,
         inputs: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 512,
         temperature: float = 0.85,
@@ -745,21 +877,33 @@ class GWenForCausalLM(nn.Module):
         if input_ids is None:
             raise ValueError("input_ids or inputs must be provided")
         input_ids = input_ids.repeat(num_return_sequences, 1)
+        if pixel_values is not None:
+            pixel_values = pixel_values.repeat_interleave(num_return_sequences, dim=0)
         if attention_mask is not None:
             attention_mask = attention_mask.repeat(num_return_sequences, 1)
 
         past_key_values = kwargs.pop("past_key_values", None)
+        rope_deltas = kwargs.pop("rope_deltas", None)
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         total_len = input_ids.shape[1]
         if streamer is not None:
             streamer.put(input_ids.cpu())
 
         for _ in range(max_new_tokens):
-            step_input = input_ids[:, -1:] if past_key_values is not None else input_ids
-            position_ids = torch.arange(total_len - step_input.shape[1], total_len, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
+            first_step = past_key_values is None
+            step_input = input_ids if first_step else input_ids[:, -1:]
+            step_pixel_values = pixel_values if first_step else None
+            if first_step:
+                position_ids, rope_deltas = self.build_3d_position_ids(step_input, return_rope_deltas=True)
+            else:
+                position_ids = self.build_3d_position_ids(
+                    step_input,
+                    past_key_values=past_key_values,
+                    rope_deltas=rope_deltas,
+                )
             outputs = self(
                 input_ids=step_input,
+                pixel_values=step_pixel_values,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -818,6 +962,20 @@ class GWenForCausalLM(nn.Module):
         return {"total": total, "embedding": embed, "lm_head": lm_head, "body": total - embed - lm_head}
 
 
+class GWenVisionProjector(nn.Module):
+    def __init__(self, vision_hidden_size: int, hidden_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(vision_hidden_size),
+            nn.Linear(vision_hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 def get_config(name: str) -> GWenConfig:
     if name not in CONFIG_PRESETS:
         raise KeyError(f"Unknown config '{name}'. Choose from {sorted(CONFIG_PRESETS)}")
@@ -833,8 +991,6 @@ def print_accel_info() -> None:
 if __name__ == "__main__":
     for name in [
         "gwen8k_hybrid",
-        "gwen8k_hybrid_128m",
-        "gwen8k_hybrid_256m",
     ]:
         cfg = get_config(name)
         model = GWenForCausalLM(cfg)
@@ -845,7 +1001,6 @@ if __name__ == "__main__":
             f"  params={stats['total']/1e6:.1f}M "
             f"embedding={stats['embedding']/1e6:.1f}M body={stats['body']/1e6:.1f}M"
         )
-        if name == "gwen8k_hybrid":
-            x = torch.randint(0, min(cfg.vocab_size, 1024), (2, 16))
-            out = model(x, labels=x)
-            print(f"  smoke loss={out['loss'].item():.4f}")
+        x = torch.randint(0, min(cfg.vocab_size, 1024), (2, 16))
+        out = model(x, labels=x)
+        print(f"  smoke loss={out['loss'].item():.4f}")

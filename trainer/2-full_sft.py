@@ -15,6 +15,7 @@ from model.model_gwen import CONFIG_PRESETS, GWenForCausalLM
 from trainer.common import (
     Logger,
     amp_context,
+    configure_vision_token_ids,
     configure_torch_speed,
     cleanup_distributed,
     cosine_lr_lambda,
@@ -57,8 +58,8 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--use_compile", action="store_true")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--gradient_accumulation_steps", "--accumulation_steps", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", "--accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", "--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--betas", type=float, nargs=2, default=[0.9, 0.95])
@@ -95,6 +96,7 @@ def main():
         max_seq_len=args.max_seq_len,
         tokenizer_vocab_size=len(tokenizer),
     )
+    configure_vision_token_ids(config, tokenizer)
     if args.linear_attention_backend != "auto": # 如果是auto的话就用预训练的，否则用命令行指定的
         config.linear_attention_backend = args.linear_attention_backend
     config.gdn_kernel_backend = args.gdn_kernel_backend

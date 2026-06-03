@@ -1,8 +1,17 @@
-torch>=2.0.0
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# RTX 5090 / sm_120 needs PyTorch CUDA 12.8+ wheels.
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
 transformers>=4.40.0
 tokenizers>=0.19.0
 sentencepiece>=0.2.0
 safetensors>=0.4.0
+pillow>=10.0.0
+pandas>=2.0.0
+pyarrow>=15.0.0
 fastapi>=0.100.0
 uvicorn>=0.23.0
 streamlit>=1.30.0

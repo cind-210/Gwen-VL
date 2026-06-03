@@ -23,6 +23,10 @@ _LAST_TOKENIZER_VOCAB_SIZE: Optional[int] = None
 DEFAULT_TOKENIZER_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "model", "tokenizer_mini8k")
 )
+VISION_START = "<|vision_start|>"
+VISION_END = "<|vision_end|>"
+IMAGE_PAD = "<|image_pad|>"
+VISION_SPECIAL_TOKENS = [VISION_START, VISION_END, IMAGE_PAD]
 
 
 def set_seed(seed: int) -> None:
@@ -153,6 +157,7 @@ def load_tokenizer(tokenizer_path: str = DEFAULT_TOKENIZER_PATH):
                 "Run scripts/train_tokenizer.py first, or pass model/tokenizer explicitly for the Qwen tokenizer."
             )
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    tokenizer.add_special_tokens({"additional_special_tokens": VISION_SPECIAL_TOKENS})
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     required_tokens = ["<|im_start|>", "<|im_end|>"]
@@ -170,6 +175,14 @@ def load_tokenizer(tokenizer_path: str = DEFAULT_TOKENIZER_PATH):
     global _LAST_TOKENIZER_VOCAB_SIZE
     _LAST_TOKENIZER_VOCAB_SIZE = int(len(tokenizer))
     return tokenizer
+
+
+def configure_vision_token_ids(config: GWenConfig, tokenizer) -> GWenConfig:
+    config.vocab_size = int(len(tokenizer))
+    config.vision_start_token_id = int(tokenizer.convert_tokens_to_ids(VISION_START))
+    config.vision_end_token_id = int(tokenizer.convert_tokens_to_ids(VISION_END))
+    config.image_token_id = int(tokenizer.convert_tokens_to_ids(IMAGE_PAD))
+    return config
 
 
 def resolve_dtype(dtype: str, device: torch.device) -> Tuple[torch.dtype, str]:
@@ -293,6 +306,7 @@ def save_checkpoint(
 ) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     model_state = unwrap_model(model).state_dict()
+    model_state = {key: value for key, value in model_state.items() if not key.startswith("visual.")}
     payload = {
         "model_state_dict": {k: v.detach().cpu() for k, v in model_state.items()},
         "config": config.to_dict(),
@@ -325,7 +339,7 @@ def load_model_weights(model, checkpoint, device: torch.device, strict: bool = F
                 continue
             filtered[key] = value
         missing, unexpected = target_model.load_state_dict(filtered, strict=False)
-        ckpt["missing_keys"] = list(missing)
+        ckpt["missing_keys"] = [key for key in missing if not key.startswith("visual.")]
         ckpt["unexpected_keys"] = list(unexpected)
         ckpt["skipped_shape_mismatch"] = skipped
     else:

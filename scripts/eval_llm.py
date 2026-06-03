@@ -13,7 +13,7 @@ from transformers import TextStreamer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model.model_gwen import CONFIG_PRESETS, GWenForCausalLM
-from trainer.common import config_from_checkpoint, load_checkpoint, load_model_weights, load_tokenizer
+from trainer.common import configure_vision_token_ids, config_from_checkpoint, load_checkpoint, load_model_weights, load_tokenizer
 
 
 def init_model(args):
@@ -25,6 +25,7 @@ def init_model(args):
         max_seq_len=args.max_seq_len,
         tokenizer_vocab_size=len(tokenizer),
     )
+    configure_vision_token_ids(config, tokenizer)
     model = GWenForCausalLM(config)
     load_info = load_model_weights(model, ckpt, torch.device(args.device), strict=False)
     dtype = torch.float16 if args.device.startswith("cuda") else torch.float32

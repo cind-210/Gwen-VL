@@ -2,6 +2,7 @@
     GWenConfig,
     GWenForCausalLM,
     GWenModel,
+    GWenVisionProjector,
 )
 from .model_lora import (
     LoRAConfig,

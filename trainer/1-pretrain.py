@@ -15,6 +15,7 @@ from model.model_gwen import CONFIG_PRESETS, GWenForCausalLM, print_accel_info
 from trainer.common import (
     Logger,
     amp_context,
+    configure_vision_token_ids,
     configure_torch_speed,
     cleanup_distributed,
     cosine_lr_lambda,
@@ -44,15 +45,15 @@ def parse_args():
     parser.add_argument("--dataset_mode", default="lazy", choices=["lazy", "packed"])
     parser.add_argument("--data_cache_dir", default="", help="Tokenized pretrain cache directory")
     parser.add_argument("--no_data_cache", action="store_true", help="Disable tokenized pretrain cache")
-    parser.add_argument("--max_seq_len", type=int, default=512) 
+    parser.add_argument("--max_seq_len", type=int, default=340)
     parser.add_argument("--linear_attention_backend", default="gdn", choices=["gdn", "full"])
     parser.add_argument("--gdn_kernel_backend", default="auto", choices=["auto", "fla", "torch"])
     parser.add_argument("--gated_attention", default="sigmoid", choices=["none", "headwise", "elementwise", "sigmoid"])
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--use_compile", action="store_true")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--gradient_accumulation_steps", "--accumulation_steps", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", "--accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--betas", type=float, nargs=2, default=[0.9, 0.95])
@@ -82,6 +83,7 @@ def main():
 
     tokenizer = load_tokenizer(args.tokenizer_path)
     config = get_config(args.config, args.max_seq_len)
+    configure_vision_token_ids(config, tokenizer)
     config.linear_attention_backend = args.linear_attention_backend
     config.gdn_kernel_backend = args.gdn_kernel_backend
     config.gated_attention = args.gated_attention

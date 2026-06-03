@@ -7,7 +7,7 @@ import json
 import os
 import random
 import time
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -15,9 +15,12 @@ from torch.utils.data import Dataset
 
 CHATML_START = "<|im_start|>"
 CHATML_END = "<|im_end|>"
+VISION_START = "<|vision_start|>"
+VISION_END = "<|vision_end|>"
+IMAGE_PAD = "<|image_pad|>"
 DEFAULT_SYSTEM_PROMPTS = [
     "You are a helpful assistant.",
-    "你是一个乐于助人的AI助手，你叫作GWen，是由ChengJun开发的。",
+    "你是一个乐于助人的AI助手，你叫作GWen，是由ChengJun和Cind开发的。",
 ]
 
 
@@ -132,6 +135,68 @@ def build_chatml_features(
         "labels": torch.tensor(labels, dtype=torch.long),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
     }
+
+
+def build_vlm_chatml_features(
+    conversations: Sequence[Dict[str, str]],
+    tokenizer,
+    max_length: int,
+    assistant_only_loss: bool = True,
+) -> Dict[str, torch.Tensor]:
+    return build_chatml_features(conversations, tokenizer, max_length, assistant_only_loss=assistant_only_loss)
+
+
+def normalize_vlm_conversations(item: Dict, image_token_count: int) -> Tuple[List[Dict[str, str]], str]:
+    raw_messages = item.get("conversations") or item.get("messages")
+    if not isinstance(raw_messages, list):
+        return [], ""
+
+    image_path = str(item.get("image", item.get("image_path", "")) or "")
+    image_placeholder = VISION_START + (IMAGE_PAD * image_token_count) + VISION_END
+    role_map = {
+        "human": "user",
+        "user": "user",
+        "gpt": "assistant",
+        "assistant": "assistant",
+        "model": "assistant",
+        "system": "system",
+        "tool": "tool",
+    }
+    conversations: List[Dict[str, str]] = []
+    inserted_top_level_image = False
+    for message in raw_messages:
+        if not isinstance(message, dict):
+            continue
+        raw_role = message.get("role", message.get("from", "user"))
+        role = role_map.get(str(raw_role).lower())
+        if role is None:
+            continue
+        content = message.get("content", message.get("value", message.get("text", "")))
+        parts: List[str] = []
+        if isinstance(content, list):
+            for piece in content:
+                if not isinstance(piece, dict):
+                    continue
+                piece_type = str(piece.get("type", "")).lower()
+                if piece_type == "image":
+                    candidate = piece.get("image", piece.get("path", ""))
+                    if candidate:
+                        image_path = str(candidate)
+                    parts.append(image_placeholder)
+                elif piece_type == "text":
+                    text = piece.get("text", "")
+                    if text:
+                        parts.append(str(text))
+        else:
+            text = "" if content is None else str(content)
+            if image_path and role == "user" and not inserted_top_level_image:
+                parts.append(image_placeholder)
+                inserted_top_level_image = True
+            parts.append(text)
+        merged = "".join(parts).strip()
+        if merged:
+            conversations.append({"role": role, "content": merged})
+    return conversations, image_path
 
 
 class LazyPretrainDataset(Dataset):
@@ -335,6 +400,50 @@ class SFTDataset(Dataset):
             if random.random() < self.add_system_prob:
                 conversations = [{"role": "system", "content": random.choice(DEFAULT_SYSTEM_PROMPTS)}] + conversations
         return build_chatml_features(conversations, self.tokenizer, self.max_length, assistant_only_loss=True)
+
+
+class VLMSFTDataset(Dataset):
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer,
+        image_processor,
+        max_length: int = 1024,
+        image_root: str = "",
+        image_token_count: int = 64,
+    ):
+        from PIL import Image
+
+        self.Image = Image
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.max_length = max_length
+        self.image_root = image_root
+        self.image_token_count = image_token_count
+        self.data = []
+        for item in read_jsonl(data_path):
+            conversations, image_path = normalize_vlm_conversations(item, image_token_count)
+            if conversations and image_path and has_assistant_turn(conversations):
+                self.data.append({"conversations": conversations, "image": image_path})
+        if not self.data:
+            raise ValueError(f"No single-image VLM conversations found in {data_path}")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def _resolve_image_path(self, image_path: str) -> str:
+        if os.path.isabs(image_path) or not self.image_root:
+            return image_path
+        return os.path.join(self.image_root, image_path)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.data[idx]
+        features = build_vlm_chatml_features(item["conversations"], self.tokenizer, self.max_length, assistant_only_loss=True)
+        image_path = self._resolve_image_path(item["image"])
+        image = self.Image.open(image_path).convert("RGB")
+        pixel_values = self.image_processor(images=image, return_tensors="pt")["pixel_values"][0]
+        features["pixel_values"] = pixel_values
+        return features
 
 
 class DPODataset(Dataset):
