@@ -39,8 +39,8 @@ except Exception:
 class GWenConfig:
     vocab_size: int = 8192
     hidden_size: int = 1024
-    num_hidden_layers: int = 24
-    intermediate_size: int = 3584
+    num_hidden_layers: int = 16
+    intermediate_size: int = 3328
     hidden_act: str = "silu"
     max_position_embeddings: int = 8192
     rms_norm_eps: float = 1e-6
@@ -140,8 +140,8 @@ class GWenConfig:
         return cls(
             vocab_size=8192,
             hidden_size=1024,
-            num_hidden_layers=24,
-            intermediate_size=3584,
+            num_hidden_layers=16,
+            intermediate_size=3328,
             num_attention_heads=8,
             num_key_value_heads=2,
             head_dim=256,
@@ -165,13 +165,13 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (x * self.weight).to(dtype)
+        return (x * (1.0 + self.weight.float())).to(dtype)
 
 
 def precompute_freqs_cis(dim: int, max_len: int, theta: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -561,7 +561,7 @@ class GatedDeltaNet(nn.Module):
             output, state = self._chunk_delta_rule(q, k, v, decay, beta, state)
         else:
             output, state = self._recurrent_delta_rule(q, k, v, decay, beta, state)
-        output = self.norm(output * F.silu(z))
+        output = self.norm(output) * F.silu(z)
         output = output.reshape(batch, seq_len, self.qkv_dim)
         output = self.dropout(self.out_proj(output))
         present = {"state": state.detach(), "conv": new_conv_cache.detach()} if use_cache else None
@@ -704,12 +704,13 @@ class GWenForCausalLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, RMSNorm):
-            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.weight)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
+        image_indices: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -720,7 +721,7 @@ class GWenForCausalLM(nn.Module):
         **_: Dict,
     ) -> Dict[str, torch.Tensor]:
         if pixel_values is not None:
-            inputs_embeds = self.prepare_inputs_embeds(input_ids, pixel_values)
+            inputs_embeds = self.prepare_inputs_embeds(input_ids, pixel_values, image_indices=image_indices)
         if position_ids is None:
             position_ids = self.build_3d_position_ids(input_ids, past_key_values=past_key_values)
         hidden_states, presents = self.model(
@@ -837,20 +838,35 @@ class GWenForCausalLM(nn.Module):
             return position_ids, deltas
         return position_ids
 
-    def prepare_inputs_embeds(self, input_ids: torch.Tensor, pixel_values: Optional[torch.Tensor]) -> torch.Tensor:
+    def prepare_inputs_embeds(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: Optional[torch.Tensor],
+        image_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         inputs_embeds = self.model.embed_tokens(input_ids)
         if pixel_values is None:
             return inputs_embeds
         if self.config.image_token_id < 0:
             raise ValueError("config.image_token_id must be set before VLM forward")
         image_features = self.get_image_features(pixel_values).to(inputs_embeds.dtype)
+        target_input_ids = input_ids
+        if image_indices is not None:
+            image_indices = image_indices.to(input_ids.device)
+            target_input_ids = input_ids.index_select(0, image_indices)
         image_mask = input_ids.eq(self.config.image_token_id)
+        target_image_mask = target_input_ids.eq(self.config.image_token_id)
         expected_tokens = image_features.shape[1]
-        token_counts = image_mask.sum(dim=1)
+        token_counts = target_image_mask.sum(dim=1)
         if not torch.all(token_counts.eq(expected_tokens)):
             raise ValueError(f"Each sample must contain exactly {expected_tokens} <|image_pad|> tokens")
         inputs_embeds = inputs_embeds.clone()
-        inputs_embeds[image_mask] = image_features.reshape(-1, image_features.shape[-1])
+        if image_indices is None:
+            inputs_embeds[image_mask] = image_features.reshape(-1, image_features.shape[-1])
+        else:
+            selected_embeds = inputs_embeds.index_select(0, image_indices).clone()
+            selected_embeds[target_image_mask] = image_features.reshape(-1, image_features.shape[-1])
+            inputs_embeds[image_indices] = selected_embeds
         return inputs_embeds
 
     @torch.inference_mode()

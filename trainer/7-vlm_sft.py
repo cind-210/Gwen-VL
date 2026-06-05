@@ -11,7 +11,7 @@ import torch
 from transformers import SiglipImageProcessor
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from dataset import VLMSFTDataset
+from dataset import MiniMindVParquetDataset, VLMSFTDataset, vlm_collate_fn
 from model.model_gwen import CONFIG_PRESETS, GWenForCausalLM
 from trainer.common import (
     Logger,
@@ -42,8 +42,9 @@ def parse_args():
     parser.add_argument("--config", default="gwen8k_hybrid", choices=sorted(CONFIG_PRESETS))
     parser.add_argument("--tokenizer_path", default="model/tokenizer_mini8k")
     parser.add_argument("--vision_model_path", default="models/siglip2-base-p32-256-ve")
-    parser.add_argument("--pretrained", required=True)
+    parser.add_argument("--llm_checkpoint", required=True)
     parser.add_argument("--data_path", required=True)
+    parser.add_argument("--data_format", default="jsonl", choices=["jsonl", "minimind_v_parquet"])
     parser.add_argument("--image_root", default="")
     parser.add_argument("--out_dir", default="./out")
     parser.add_argument("--max_seq_len", type=int, default=768)
@@ -58,11 +59,12 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--use_compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--device", default="")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--allow_partial_load", action="store_true", help="Allow missing/skipped VLM checkpoint weights")
+    parser.add_argument("--allow_partial_load", action="store_true", help="Allow missing/skipped text checkpoint weights")
     return parser.parse_args()
 
 
@@ -75,7 +77,7 @@ def main():
     logger = Logger(os.path.join(args.out_dir, "vlm_sft.log"), enabled=env["is_main"])
 
     tokenizer = load_tokenizer(args.tokenizer_path)
-    ckpt = load_checkpoint(args.pretrained, map_location="cpu")
+    ckpt = load_checkpoint(args.llm_checkpoint, map_location="cpu")
     config = config_from_checkpoint(
         ckpt,
         fallback_name=args.config,
@@ -86,15 +88,16 @@ def main():
     config.vision_model_name = args.vision_model_path
     model = GWenForCausalLM(config, vision_model_path=args.vision_model_path).to(env["device"])
     load_info = load_model_weights(model, ckpt, env["device"], strict=False)
-    missing = len(load_info.get("missing_keys", []))
+    missing_keys = load_info.get("missing_keys", [])
+    missing = len([key for key in missing_keys if not key.startswith("vision_projector.")])
     unexpected = len(load_info.get("unexpected_keys", []))
     skipped = len(load_info.get("skipped_shape_mismatch", {}))
     if env["is_main"]:
-        logger.info(f"Loaded VLM checkpoint: missing={missing} unexpected={unexpected} skipped_shape={skipped}")
+        logger.info(f"Loaded LLM checkpoint: missing={missing} unexpected={unexpected} skipped_shape={skipped}")
     if (missing or unexpected or skipped) and not args.allow_partial_load:
         raise RuntimeError(
-            "VLM checkpoint did not fully match the VLM SFT model. "
-            "Use the same tokenizer/config/vision path as VLM pretrain, or pass --allow_partial_load only for experiments."
+            "Checkpoint did not fully match the VLM SFT model. "
+            "Use the same tokenizer/config, or pass --allow_partial_load only for experiments."
         )
     for param in model.visual.parameters():
         param.requires_grad = False
@@ -125,19 +128,36 @@ def main():
                     param.requires_grad = True
 
     dtype, dtype_name = resolve_dtype(args.dtype, env["device"])
+    if args.use_compile and hasattr(torch, "compile"):
+        model.model = torch.compile(model.model)
     model = wrap_ddp(model, env)
 
     image_processor = SiglipImageProcessor.from_pretrained(args.vision_model_path)
     image_token_count = config.image_grid_size * config.image_grid_size
-    dataset = VLMSFTDataset(
-        args.data_path,
-        tokenizer,
-        image_processor,
-        max_length=args.max_seq_len,
-        image_root=args.image_root,
-        image_token_count=image_token_count,
+    if args.data_format == "jsonl":
+        dataset = VLMSFTDataset(
+            args.data_path,
+            tokenizer,
+            image_processor,
+            max_length=args.max_seq_len,
+            image_root=args.image_root,
+            image_token_count=image_token_count,
+        )
+    else:
+        dataset = MiniMindVParquetDataset(
+            args.data_path,
+            tokenizer,
+            image_processor,
+            max_length=args.max_seq_len,
+            image_token_count=image_token_count,
+        )
+    loader, sampler = create_dataloader(
+        dataset,
+        args.batch_size,
+        env["distributed"],
+        num_workers=args.num_workers,
+        collate_fn=vlm_collate_fn if args.data_format == "minimind_v_parquet" else None,
     )
-    loader, sampler = create_dataloader(dataset, args.batch_size, env["distributed"], num_workers=args.num_workers)
     total_steps = args.max_steps if args.max_steps > 0 else max(1, len(loader) * args.epochs // args.gradient_accumulation_steps)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, unwrap_model(model).parameters()),
@@ -162,8 +182,8 @@ def main():
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        epoch_loss_sum = 0.0
-        epoch_loss_count = 0
+        log_loss_sum = 0.0
+        log_loss_count = 0
         epoch_start = time.time()
         iter_per_epoch = len(loader)
         for batch_idx, batch in enumerate(loader):
@@ -174,11 +194,15 @@ def main():
                 input_ids = batch["input_ids"].to(env["device"], non_blocking=True)
                 labels = batch["labels"].to(env["device"], non_blocking=True)
                 attention_mask = batch["attention_mask"].to(env["device"], non_blocking=True)
-                pixel_values = batch["pixel_values"].to(env["device"], non_blocking=True)
+                pixel_values = batch.get("pixel_values")
+                pixel_values = pixel_values.to(env["device"], non_blocking=True) if pixel_values is not None else None
+                image_indices = batch.get("image_indices")
+                image_indices = image_indices.to(env["device"], non_blocking=True) if image_indices is not None else None
                 with amp_context(dtype_name, dtype, env["device"]):
                     loss = model(
                         input_ids=input_ids,
                         pixel_values=pixel_values,
+                        image_indices=image_indices,
                         labels=labels,
                         attention_mask=attention_mask,
                     )["loss"]
@@ -188,18 +212,20 @@ def main():
                 else:
                     loss.backward()
             current_loss = loss.item() * args.gradient_accumulation_steps
-            epoch_loss_sum += current_loss
-            epoch_loss_count += 1
+            log_loss_sum += current_loss
+            log_loss_count += 1
             current_batch = batch_idx + 1
             if env["is_main"] and (current_batch % args.log_interval == 0 or current_batch == 1):
-                avg_loss = epoch_loss_sum / max(1, epoch_loss_count)
+                avg_loss = log_loss_sum / max(1, log_loss_count)
                 elapsed = time.time() - epoch_start
                 eta = (elapsed / max(1, current_batch)) * max(0, iter_per_epoch - current_batch)
                 logger.info(
                     f"VLM SFT Epoch [{epoch+1}/{args.epochs}] ({current_batch}/{iter_per_epoch}) "
-                    f"loss={current_loss:.4f} avg_loss={avg_loss:.4f} "
+                    f"avg_loss={avg_loss:.4f} "
                     f"lr={optimizer.param_groups[0]['lr']:.2e} eta={format_eta(eta)} step={step}"
                 )
+                log_loss_sum = 0.0
+                log_loss_count = 0
             if sync_grad:
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)

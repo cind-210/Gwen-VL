@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import random
@@ -441,6 +442,106 @@ class VLMSFTDataset(Dataset):
         features = build_vlm_chatml_features(item["conversations"], self.tokenizer, self.max_length, assistant_only_loss=True)
         image_path = self._resolve_image_path(item["image"])
         image = self.Image.open(image_path).convert("RGB")
+        pixel_values = self.image_processor(images=image, return_tensors="pt")["pixel_values"][0]
+        features["pixel_values"] = pixel_values
+        return features
+
+
+def parse_minimind_v_conversations(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def parse_minimind_v_image_bytes(value) -> bytes:
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ValueError(f"Expected single-image sample, got {len(value)} images")
+        return parse_minimind_v_image_bytes(value[0])
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    raise ValueError(f"MiniMind-V image_bytes must be bytes or single-element bytes list, got {type(value).__name__}")
+
+
+def vlm_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    output = {
+        "input_ids": torch.stack([item["input_ids"] for item in batch]),
+        "labels": torch.stack([item["labels"] for item in batch]),
+        "attention_mask": torch.stack([item["attention_mask"] for item in batch]),
+    }
+    image_items = [(idx, item["pixel_values"]) for idx, item in enumerate(batch) if "pixel_values" in item]
+    if image_items:
+        output["pixel_values"] = torch.stack([pixel_values for _, pixel_values in image_items])
+        output["image_indices"] = torch.tensor([idx for idx, _ in image_items], dtype=torch.long)
+    return output
+
+
+class MiniMindVParquetDataset(Dataset):
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer,
+        image_processor,
+        max_length: int = 1024,
+        image_token_count: int = 64,
+        image_column: str = "image_bytes",
+        conversations_column: str = "conversations",
+    ):
+        from PIL import Image
+        import pandas as pd
+
+        self.Image = Image
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.max_length = max_length
+        self.image_token_count = image_token_count
+        self.data = []
+        parquet_files = self._resolve_parquet_files(data_path)
+        for parquet_path in parquet_files:
+            table = pd.read_parquet(parquet_path)
+            if image_column not in table.columns or conversations_column not in table.columns:
+                raise KeyError(f"{parquet_path} must contain {image_column!r} and {conversations_column!r} columns")
+            for _, row in table.iterrows():
+                conversations_value = parse_minimind_v_conversations(row[conversations_column])
+                has_image = bool(row["has_image"]) if "has_image" in table.columns else True
+                item = {"conversations": conversations_value}
+                if has_image:
+                    item["image"] = "__minimind_v_image__"
+                conversations, image_path = normalize_vlm_conversations(item, image_token_count)
+                if conversations and has_assistant_turn(conversations):
+                    record = {"conversations": conversations}
+                    if has_image and image_path:
+                        record["image_bytes"] = parse_minimind_v_image_bytes(row[image_column])
+                    self.data.append(record)
+        if not self.data:
+            raise ValueError(f"No single-image MiniMind-V parquet conversations found in {data_path}")
+
+    @staticmethod
+    def _resolve_parquet_files(data_path: str) -> List[str]:
+        if os.path.isdir(data_path):
+            files = [
+                os.path.join(data_path, name)
+                for name in sorted(os.listdir(data_path))
+                if name.endswith(".parquet")
+            ]
+            if not files:
+                raise FileNotFoundError(f"No parquet files found in {data_path}")
+            return files
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(data_path)
+        return [data_path]
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        item = self.data[idx]
+        features = build_vlm_chatml_features(item["conversations"], self.tokenizer, self.max_length, assistant_only_loss=True)
+        if "image_bytes" not in item:
+            return features
+        image = self.Image.open(io.BytesIO(item["image_bytes"])).convert("RGB")
         pixel_values = self.image_processor(images=image, return_tensors="pt")["pixel_values"][0]
         features["pixel_values"] = pixel_values
         return features

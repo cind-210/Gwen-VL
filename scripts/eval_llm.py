@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--tokenizer_path", default="model/tokenizer_mini8k")
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.85) # 温度参数，控制生成文本的随机程度，temperature=0.85表示生成文本的随机性较低，更倾向于选择概率较高的词汇，从而提高生成文本的质量和连贯性，但可能会牺牲一些多样性
+    parser.add_argument("--temperature", type=float, default=0.6) # 温度参数，控制生成文本的随机程度
     parser.add_argument("--top_p", type=float, default=0.9) # top-p采样的概率阈值，top-p=0.9表示只在累积概率达到90%的词汇中进行采样，这种方法可以动态调整候选词汇的数量，通常比固定的top-k更能保持生成文本的多样性和质量
     parser.add_argument("--top_k", type=int, default=30) # top_k=0表示不使用top-k采样，直接在所有词汇上进行采样，top_k>0表示只在概率最高的k个词汇中进行采样
     parser.add_argument("--do_sample", type=bool, default=True) # 是否使用采样，默认为True表示使用采样，设置为False表示使用贪心解码（greedy decoding），即每次选择概率最高的词汇作为输出，这种方法通常会生成更确定性的文本，但可能缺乏多样性和创造

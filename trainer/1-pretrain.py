@@ -176,8 +176,8 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        epoch_loss_sum = 0.0
-        epoch_loss_count = 0
+        log_loss_sum = 0.0
+        log_loss_count = 0
         epoch_start_time = time.time()
         log_start_time = epoch_start_time
         log_tokens = 0
@@ -199,13 +199,13 @@ def main():
                 else:
                     loss.backward()
             current_loss = loss.item() * args.gradient_accumulation_steps
-            epoch_loss_sum += current_loss
-            epoch_loss_count += 1
+            log_loss_sum += current_loss
+            log_loss_count += 1
             current_batch = batch_idx + 1
             log_tokens += input_ids.numel() * env["world_size"]
 
             if env["is_main"] and (current_batch % args.log_interval == 0 or current_batch == 1):
-                avg_loss = epoch_loss_sum / max(1, epoch_loss_count)
+                avg_loss = log_loss_sum / max(1, log_loss_count)
                 elapsed = time.time() - epoch_start_time
                 log_elapsed = max(time.time() - log_start_time, 1e-6)
                 tokens_per_s = log_tokens / log_elapsed
@@ -213,13 +213,15 @@ def main():
                 eta = (elapsed / max(1, current_batch)) * max(0, iter_per_epoch - current_batch)
                 logger.info(
                     f"Pretrain Epoch [{epoch+1}/{args.epochs}] ({current_batch}/{iter_per_epoch}) "
-                    f"loss={current_loss:.4f} avg_loss = {avg_loss:.4f} "
+                    f"avg_loss = {avg_loss:.4f} "
                     f"lr={optimizer.param_groups[0]['lr']:.2e} eta={format_eta(eta)} "
                     f"tokens/s={tokens_per_s:.0f} optimizer_step={step} "
                     f"effective_tokens_per_step={effective_tokens}"
                 )
                 log_start_time = time.time()
                 log_tokens = 0
+                log_loss_sum = 0.0
+                log_loss_count = 0
 
             if sync_grad:
                 if scaler.is_enabled():

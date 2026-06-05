@@ -246,7 +246,7 @@ def evaluate_loss(model, loader, env: Dict, dtype_name: str, dtype: torch.dtype,
     return (loss_sum / loss_count.clamp_min(1)).item()
 
 
-def create_dataloader(dataset, batch_size: int, distributed: bool, shuffle: bool = True, num_workers: int = 0):
+def create_dataloader(dataset, batch_size: int, distributed: bool, shuffle: bool = True, num_workers: int = 0, collate_fn=None):
     sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
     loader_kwargs = {}
     if num_workers > 0:
@@ -264,6 +264,7 @@ def create_dataloader(dataset, batch_size: int, distributed: bool, shuffle: bool
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
+        collate_fn=collate_fn,
         **loader_kwargs,
     )
     return loader, sampler
