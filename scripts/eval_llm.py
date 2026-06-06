@@ -26,6 +26,7 @@ def init_model(args):
         tokenizer_vocab_size=len(tokenizer),
     )
     configure_vision_token_ids(config, tokenizer)
+    config.vlm_rope_type = args.vlm_rope_type
     model = GWenForCausalLM(config)
     load_info = load_model_weights(model, ckpt, torch.device(args.device), strict=False)
     dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
@@ -45,6 +46,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=30) # top_k=0表示不使用top-k采样，直接在所有词汇上进行采样，top_k>0表示只在概率最高的k个词汇中进行采样
     parser.add_argument("--do_sample", type=bool, default=True) # 是否使用采样，默认为True表示使用采样，设置为False表示使用贪心解码（greedy decoding），即每次选择概率最高的词汇作为输出，这种方法通常会生成更确定性的文本，但可能缺乏多样性和创造
     parser.add_argument("--repetition_penalty", type=float, default=1.05) # 重复惩罚系数，默认是1.0，表示不使用重复惩罚，设置大于1.0的值可以增加对重复词汇的惩罚，从而减少生成文本中的重复内容
+    parser.add_argument("--vlm_rope_type", default="rope", choices=["mrope", "rope"])
     parser.add_argument(
         "--system_prompt",
         default="",

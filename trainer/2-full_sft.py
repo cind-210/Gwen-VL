@@ -55,6 +55,7 @@ def parse_args():
     )
     parser.add_argument("--gdn_kernel_backend", default="auto", choices=["auto", "fla", "torch"])
     parser.add_argument("--gated_attention", default="auto", choices=["auto", "none", "headwise", "elementwise", "sigmoid"])
+    parser.add_argument("--vlm_rope_type", default="rope", choices=["mrope", "rope"])
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--use_compile", action="store_true")
     parser.add_argument("--epochs", type=int, default=3)
@@ -72,6 +73,7 @@ def parse_args():
     parser.add_argument("--eval_data_path", default="")
     parser.add_argument("--eval_interval", type=int, default=0)
     parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--save_interval_steps", type=int, default=0)
     parser.add_argument("--resume_path", default="")
     parser.add_argument("--from_resume", type=int, default=0)
     parser.add_argument("--allow_partial_load", action="store_true", help="Allow missing/skipped pretrain weights")
@@ -103,7 +105,9 @@ def main():
     if args.gated_attention != "auto": # 如果是auto的话就用预训练的，否则用命令行指定的
         config.gated_attention = args.gated_attention
         config.attn_output_gate = args.gated_attention != "none"
+    config.vlm_rope_type = args.vlm_rope_type
     config.dropout = args.dropout
+    checkpoint_prefix = f"sft-{config.vlm_rope_type}"
     model = GWenForCausalLM(config).to(env["device"])
     load_info = load_model_weights(model, pretrain_ckpt, env["device"], strict=False)
     missing = len(load_info.get("missing_keys", []))
@@ -155,9 +159,10 @@ def main():
 
     step = 0
     start_epoch = 0
+    start_batch = 0
     resume_path = args.resume_path or os.path.join(args.out_dir, "sft_resume.pth")
     if args.from_resume and os.path.exists(resume_path):
-        step, start_epoch = load_resume(resume_path, model, optimizer, scheduler, scaler, env["device"])
+        step, start_epoch, start_batch = load_resume(resume_path, model, optimizer, scheduler, scaler, env["device"])
 
     stats = unwrap_model(model).get_param_breakdown()
     logger.banner(f"GWen SFT {args.config}: total={stats['total']/1e6:.1f}M dtype={dtype_name}")
@@ -173,6 +178,8 @@ def main():
         log_tokens = 0
         iter_per_epoch = len(loader)
         for batch_idx, batch in enumerate(loader):
+            if epoch == start_epoch and batch_idx < start_batch:
+                continue
             if args.max_steps > 0 and step >= args.max_steps:
                 break
             sync_grad = (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader)
@@ -224,13 +231,28 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
+                if env["is_main"] and args.save_interval_steps > 0 and step % args.save_interval_steps == 0:
+                    step_path = os.path.join(args.out_dir, f"{checkpoint_prefix}-{step}.pth")
+                    save_checkpoint(
+                        step_path,
+                        model,
+                        config,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        step=step,
+                        epoch=epoch,
+                        train_args=vars(args),
+                        extra={"batch_idx": batch_idx + 1},
+                    )
+                    logger.info(f"Saved checkpoint {step_path}")
                 if eval_loader is not None and args.eval_interval > 0 and step % args.eval_interval == 0:
                     eval_loss = evaluate_loss(model, eval_loader, env, dtype_name, dtype, args.eval_steps)
                     if env["is_main"]:
                         logger.info(f"Eval step={step} loss={eval_loss:.4f}")
         if env["is_main"]:
             save_checkpoint(
-                os.path.join(args.out_dir, f"sft_epoch{epoch+1}.pth"),
+                os.path.join(args.out_dir, f"{checkpoint_prefix}-epoch{epoch+1}.pth"),
                 model,
                 config,
                 optimizer,
@@ -239,13 +261,14 @@ def main():
                 step=step,
                 epoch=epoch + 1,
                 train_args=vars(args),
+                extra={"batch_idx": 0},
             )
         if args.max_steps > 0 and step >= args.max_steps:
             break
 
     if env["is_main"]:
-        final_path = os.path.join(args.out_dir, "sft_final.pth")
-        save_checkpoint(final_path, model, config, optimizer, scheduler, scaler, step=step, epoch=args.epochs, train_args=vars(args))
+        final_path = os.path.join(args.out_dir, f"{checkpoint_prefix}-final.pth")
+        save_checkpoint(final_path, model, config, optimizer, scheduler, scaler, step=step, epoch=args.epochs, train_args=vars(args), extra={"batch_idx": 0})
         logger.info(f"Done. Saved {final_path}")
     cleanup_distributed()
 

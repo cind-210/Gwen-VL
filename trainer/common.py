@@ -348,7 +348,7 @@ def load_model_weights(model, checkpoint, device: torch.device, strict: bool = F
     return ckpt
 
 
-def load_resume(path: str, model, optimizer, scheduler, scaler, device: torch.device) -> Tuple[int, int]:
+def load_resume(path: str, model, optimizer, scheduler, scaler, device: torch.device) -> Tuple[int, int, int]:
     ckpt = load_model_weights(model, path, device, strict=False)
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -356,7 +356,7 @@ def load_resume(path: str, model, optimizer, scheduler, scaler, device: torch.de
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     if scaler is not None and scaler.is_enabled() and "scaler_state_dict" in ckpt:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-    return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
+    return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0)), int(ckpt.get("batch_idx", 0))
 
 
 def format_seconds(seconds: float) -> str:

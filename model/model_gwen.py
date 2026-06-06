@@ -3,7 +3,7 @@ GWen text-only language model.
 
 The model is a compact, readable PyTorch implementation of the Qwen3.5 text
 backbone ideas: 3 linear-attention blocks followed by 1 full-attention block,
-Partial RoPE on full-attention layers, QK-Norm, SwiGLU, and tied token embeddings.
+Qwen3.5-style M-RoPE on full-attention layers, QK-Norm, SwiGLU, and tied token embeddings.
 """
 
 from __future__ import annotations
@@ -77,6 +77,7 @@ class GWenConfig:
     vision_patch_size: int = 32
     image_grid_size: int = 8
     vision_hidden_size: int = 768
+    vlm_rope_type: str = "rope"
 
     def __post_init__(self) -> None:
         self.validate()
@@ -119,6 +120,11 @@ class GWenConfig:
             raise ValueError("full attention rotary dim must be even")
         if self.image_grid_size != self.image_size // self.vision_patch_size:
             raise ValueError("image_grid_size must equal image_size // vision_patch_size")
+        if self.vlm_rope_type not in {"mrope", "rope"}:
+            raise ValueError("vlm_rope_type must be one of: mrope, rope")
+        rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+        if self.vlm_rope_type == "mrope" and rotary_dim < 32:
+            raise ValueError("M-RoPE requires full attention rotary dim >= 32")
         if self.gated_attention not in {"none", "sigmoid", "headwise", "elementwise"}:
             raise ValueError("gated_attention must be one of: none, sigmoid, headwise, elementwise")
         if self.linear_attention_backend not in {"gdn", "full"}:
@@ -183,6 +189,26 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def split_mrope_sections(pair_count: int) -> Tuple[int, int, int]:
+    base = pair_count // 3
+    remainder = pair_count % 3
+    return base + (1 if remainder > 0 else 0), base + (1 if remainder > 1 else 0), base
+
+
+def apply_interleaved_mrope(freqs: torch.Tensor, mrope_sections: Tuple[int, int, int]) -> torch.Tensor:
+    if freqs.dim() == 3:
+        return freqs
+    if freqs.dim() != 4 or freqs.shape[0] != 3:
+        raise ValueError("M-RoPE freqs must have shape [3, batch, seq, pairs] or [batch, seq, pairs]")
+    result = freqs[0].clone()
+    _, h_section, w_section = mrope_sections
+    if h_section > 0:
+        result[..., 1 : h_section * 3 : 3] = freqs[1, ..., 1 : h_section * 3 : 3]
+    if w_section > 0:
+        result[..., 2 : w_section * 3 : 3] = freqs[2, ..., 2 : w_section * 3 : 3]
+    return result
 
 
 def apply_rotary_pos_emb(
@@ -593,6 +619,7 @@ class GWenModel(nn.Module):
         self.layers = nn.ModuleList([GWenDecoderLayer(config, kind) for kind in config.layer_types])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         fa_rotary = int(config.head_dim * config.partial_rotary_factor)
+        self.mrope_sections = split_mrope_sections(fa_rotary // 2)
         cos, sin = precompute_freqs_cis(fa_rotary, config.max_position_embeddings, config.rope_theta)
         self.register_buffer("freqs_cos", cos, persistent=False)
         self.register_buffer("freqs_sin", sin, persistent=False)
@@ -621,10 +648,10 @@ class GWenModel(nn.Module):
                         break
             position_ids = torch.arange(past_len, past_len + seq_len, device=hidden_states.device)
             position_ids = position_ids.unsqueeze(0).expand(batch, -1)
-        if position_ids.dim() == 3:
-            position_ids = position_ids[..., 0]
-        cos = self.freqs_cos[position_ids].to(hidden_states.device)
-        sin = self.freqs_sin[position_ids].to(hidden_states.device)
+        if position_ids.dim() == 2:
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        cos = apply_interleaved_mrope(self.freqs_cos[position_ids].to(hidden_states.device), self.mrope_sections)
+        sin = apply_interleaved_mrope(self.freqs_sin[position_ids].to(hidden_states.device), self.mrope_sections)
         presents = [] if use_cache else None
 
         for idx, layer in enumerate(self.layers):
@@ -646,6 +673,7 @@ class GWenForCausalLM(nn.Module):
     def __init__(self, config: Optional[GWenConfig] = None, vision_model_path: Optional[str] = None):
         super().__init__()
         self.config = config or GWenConfig.gwen8k_hybrid()
+        self.config.validate()
         self.model = GWenModel(self.config)
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
@@ -755,10 +783,56 @@ class GWenForCausalLM(nn.Module):
                 if item is not None and "key" in item:
                     past_len = item["key"].shape[1]
                     break
-        position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).expand(batch, -1)
+        if past_len > 0:
+            delta = 0 if rope_deltas is None else rope_deltas.to(input_ids.device).view(batch, 1)
+            text_pos = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
+            position_ids = text_pos.expand(batch, -1) + delta
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            if return_rope_deltas:
+                return position_ids, delta.squeeze(1)
+            return position_ids
+
+        text_pos = torch.arange(seq_len, device=input_ids.device)
+        position_ids = text_pos.unsqueeze(0).expand(batch, -1)
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).clone()
+        if self.config.image_token_id < 0:
+            if return_rope_deltas:
+                return position_ids, torch.zeros(batch, dtype=torch.long, device=input_ids.device)
+            return position_ids
+        if self.config.vlm_rope_type == "rope":
+            if return_rope_deltas:
+                return position_ids, torch.zeros(batch, dtype=torch.long, device=input_ids.device)
+            return position_ids
+
+        image_mask = input_ids.eq(self.config.image_token_id)
+        grid = self.config.image_grid_size
+        row = torch.arange(grid, device=input_ids.device).repeat_interleave(grid)
+        col = torch.arange(grid, device=input_ids.device).repeat(grid)
+        temporal = torch.zeros_like(row)
+        image_pos = torch.stack((temporal, row, col), dim=0)
+        expected_tokens = grid * grid
+        deltas = torch.zeros(batch, dtype=torch.long, device=input_ids.device)
+        for batch_idx in range(batch):
+            indexes = torch.nonzero(image_mask[batch_idx], as_tuple=False).squeeze(-1)
+            if indexes.numel() == 0:
+                continue
+            if indexes.numel() != expected_tokens:
+                raise ValueError(f"Each image sample must contain {expected_tokens} <|image_pad|> tokens")
+            expected_indexes = torch.arange(indexes[0], indexes[0] + expected_tokens, device=input_ids.device)
+            if not torch.all(indexes.eq(expected_indexes)):
+                raise ValueError("<|image_pad|> tokens must form one contiguous image block")
+
+            image_start = int(indexes[0].item())
+            position_ids[:, batch_idx, indexes] = image_pos + image_start
+            after_image = image_start + expected_tokens
+            text_after = seq_len - after_image
+            if text_after > 0:
+                tail_start = image_start + grid
+                tail_pos = torch.arange(tail_start, tail_start + text_after, device=input_ids.device)
+                position_ids[:, batch_idx, after_image:] = tail_pos.unsqueeze(0).expand(3, -1)
+            deltas[batch_idx] = int(position_ids[:, batch_idx].max().item()) + 1 - seq_len
         if return_rope_deltas:
-            return position_ids, torch.zeros(batch, dtype=torch.long, device=input_ids.device)
+            return position_ids, deltas
         return position_ids
 
     def prepare_inputs_embeds(

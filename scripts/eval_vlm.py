@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=30)
     parser.add_argument("--repetition_penalty", type=float, default=1.05)
+    parser.add_argument("--vlm_rope_type", default="rope", choices=["mrope", "rope"])
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -84,6 +85,7 @@ def main():
     )
     configure_vision_token_ids(config, tokenizer)
     config.vision_model_name = args.vision_model_path
+    config.vlm_rope_type = args.vlm_rope_type
     model = GWenForCausalLM(config, vision_model_path=args.vision_model_path)
     load_model_weights(model, ckpt, torch.device(args.device), strict=False)
     dtype = torch.float16 if args.device.startswith("cuda") else torch.float32
