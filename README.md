@@ -15,9 +15,9 @@
 
 
 
-| 图片 | 回答 |
-| --- | --- |
-| ![demo vlm 2](./asset/demo-vlm-2.png) | 这幅图片中的人物似乎是女性，她的表情充满了喜悦和兴奋。她的眼睛睁得很大，嘴巴张开，仿佛在喊或欢呼。她穿着一件白色衬衫，领口处有一条红色的领带，看起来像是一件衬衫。背景简单，没有提供任何额外的信息。这幅图片具有卡通般的质感，典型于儿童插画或动画作品。 |
+| 图片                                  | 回答                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ![demo vlm 2](./asset/demo-vlm-2.png) | 这幅图片中的人物似乎是女性，她的表情充满了喜悦和兴奋。她的眼睛睁得很大，嘴巴张开，仿佛在喊或欢呼。她穿着一件白色衬衫，领口处有一条红色的领带，看起来像是一件衬衫。背景简单，没有提供任何额外的信息。这幅图片具有卡通般的质感，典型于儿童插画或动画作品。                                                                                                                                       |
 | ![demo vlm 1](./asset/demo-vlm-1.png) | 在这张图片中，两位女性都穿着休闲服装。左边的女性穿着一件牛仔夹克，搭配一件白色衬衣和一条深色领带。她的头发是直的，看起来是中长发型，微笑着，露出牙齿。右边的女性穿着一件浅蓝色牛仔夹克，配上一件白色衬衣和一条深色领带。她的头发是黑色的，看起来是中长发型，微笑着，露出了牙齿。她的表情是愉快的，微微带着笑容，嘴巴闭合，眼睛微微眯起。她们站在一个简单的背景前，背景没有提供任何额外的信息。 |
 
 ## 更新日志
@@ -39,14 +39,12 @@
 
 ## 模型权重
 
-模型权重后续上传到 ModelScope 后补充：
-
 | 名称                                                                                                                         | 说明                                 |
 | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
 | [`pretrain-rope-final_uncompiled_s.pth`](https://modelscope.cn/models/cind2100/Gwen-VL/pretrain-rope-final_uncompiled_s.pth) | 文本预训练底座                       |
 | [`vlm_sft-mrope-final_uncompiled_s.pth`](https://modelscope.cn/models/cind2100/Gwen-VL/vlm_sft-mrope-final_uncompiled_s.pth) | llm&vlm sft数据集 混合微调出来的模型 |
 
-[SigLIP2 视觉塔](https://modelscope.cn/models/gongjy/siglip2-base-p32-256-ve)不保存进 Gwen-VL checkpoint，推理和训练时需要单独提供 `vision_model_path`。
+[SigLIP2 视觉塔](https://modelscope.cn/models/gongjy/siglip2-base-p32-256-ve)不在其中，推理和训练时需要单独提供 `vision_model_path`。
 
 ## 模型介绍
 
@@ -55,7 +53,7 @@
 Gwen-VL 首先是一个 Gwen 扩展项目，然后在此基础上加入 VLM 能力：
 
 - 层结构采用 `3 × GDN + 1 × Full Attention` 的混合模式。
-- Full Attention 支持普通 RoPE 和 M-RoPE；纯文本时 M-RoPE 会退化为普通 RoPE，因此同一份 pretrain/LLM SFT 权重可继续用于 `rope` 或 `mrope` VLM 实验。我们这里使用mrope。
+- Full Attention 支持普通 Partial RoPE 和 M-RoPE；纯文本时 M-RoPE 会退化为普通 Partial RoPE，因此同一份 pretrain/LLM SFT 权重可继续用于 `rope` 或 `mrope` VLM 实验。我们这里使用mrope。
 - 视觉塔使用 `gongjy/siglip2-base-p32-256-ve`，训练时冻结，输出为 `8 × 8 = 64` 个视觉 token。
  - 使用一层MLP作为Projector ，把 SigLIP2 hidden 映射到 Gwen hidden。
 - 图像在文本侧表示为 `<|vision_start|> + 64 个 <|image_pad|> + <|vision_end|>`，视觉特征替换 `<|image_pad|>` 。
@@ -281,6 +279,8 @@ python /root/Gwen-VL/scripts/eval_vlm.py \
   --device cuda
 ```
 输入完文字后回车，会提示输出图片路径，没有图片需要加载的时候直接回车即可。
+
+![示例](./asset/demo-vlm-2.png)
 
 ##### 文本推理：
 
