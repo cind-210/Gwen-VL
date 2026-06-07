@@ -45,11 +45,12 @@ def parse_args():
     parser.add_argument("--dataset_mode", default="lazy", choices=["lazy", "packed"])
     parser.add_argument("--data_cache_dir", default="", help="Tokenized pretrain cache directory")
     parser.add_argument("--no_data_cache", action="store_true", help="Disable tokenized pretrain cache")
-    parser.add_argument("--max_seq_len", type=int, default=340)
+    parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--linear_attention_backend", default="gdn", choices=["gdn", "full"])
     parser.add_argument("--gdn_kernel_backend", default="auto", choices=["auto", "fla", "torch"])
     parser.add_argument("--gated_attention", default="sigmoid", choices=["none", "headwise", "elementwise", "sigmoid"])
     parser.add_argument("--vlm_rope_type", default="rope", choices=["mrope", "rope"])
+    parser.add_argument("--rotary_dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--use_compile", action="store_true")
     parser.add_argument("--epochs", type=int, default=5)
@@ -91,6 +92,7 @@ def main():
     config.gated_attention = args.gated_attention
     config.attn_output_gate = args.gated_attention != "none"
     config.vlm_rope_type = args.vlm_rope_type
+    config.rotary_dim = args.rotary_dim
     config.dropout = args.dropout
     checkpoint_prefix = f"pretrain-{config.vlm_rope_type}"
     model = GWenForCausalLM(config).to(env["device"])

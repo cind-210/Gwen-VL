@@ -29,7 +29,7 @@ LINEAR_KEY_HEAD_DIM = 96
 LINEAR_VALUE_HEAD_DIM = 96
 
 FULL_ATTENTION_INTERVAL = 4
-PARTIAL_ROTARY_FACTOR = 0.25
+ROTARY_DIM = 64
 MAX_POSITION_EMBEDDINGS = 8192
 
 
@@ -47,12 +47,11 @@ def main():
         linear_key_head_dim=LINEAR_KEY_HEAD_DIM,
         linear_value_head_dim=LINEAR_VALUE_HEAD_DIM,
         full_attention_interval=FULL_ATTENTION_INTERVAL,
-        partial_rotary_factor=PARTIAL_ROTARY_FACTOR,
+        rotary_dim=ROTARY_DIM,
         max_position_embeddings=MAX_POSITION_EMBEDDINGS,
     )
     model = GWenForCausalLM(config)
     stats = model.get_param_breakdown()
-    rotary_dim = int(config.head_dim * config.partial_rotary_factor)
     print("GWen parameter estimate")
     print(f"vocab_size={config.vocab_size}")
     print(f"hidden_size={config.hidden_size}")
@@ -65,8 +64,7 @@ def main():
     print(f"linear_num_value_heads={config.linear_num_value_heads}")
     print(f"linear_key_head_dim={config.linear_key_head_dim}")
     print(f"linear_value_head_dim={config.linear_value_head_dim}")
-    print(f"partial_rotary_factor={config.partial_rotary_factor}")
-    print(f"rotary_dim={rotary_dim}")
+    print(f"rotary_dim={config.rotary_dim}")
     print(f"total_params={stats['total']:,} ({stats['total']/1e6:.2f}M)")
     print(f"embedding_params={stats['embedding']:,} ({stats['embedding']/1e6:.2f}M)")
     print(f"lm_head_params={stats['lm_head']:,} ({stats['lm_head']/1e6:.2f}M)")

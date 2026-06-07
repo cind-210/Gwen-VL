@@ -75,10 +75,11 @@ def parse_args():
     parser.add_argument("--sft_path", required=True)
     parser.add_argument("--data_path", default="./dataset/dpo.jsonl")
     parser.add_argument("--out_dir", default="./out")
-    parser.add_argument("--max_seq_len", "--max_length", type=int, default=768)
+    parser.add_argument("--max_seq_len", "--max_length", type=int, default=512)
     parser.add_argument("--linear_attention_backend", default="auto", choices=["auto", "gdn", "full"])
     parser.add_argument("--gdn_kernel_backend", default="auto", choices=["auto", "fla", "torch"])
     parser.add_argument("--gated_attention", default="auto", choices=["auto", "none", "headwise", "elementwise", "sigmoid"])
+    parser.add_argument("--rotary_dim", type=int, default=64)
     parser.add_argument("--use_compile", action="store_true")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -122,6 +123,7 @@ def main():
     if args.gated_attention != "auto":
         config.gated_attention = args.gated_attention
         config.attn_output_gate = args.gated_attention != "none"
+    config.rotary_dim = args.rotary_dim
     policy_model = GWenForCausalLM(config).to(env["device"])
     ref_model = GWenForCausalLM(config).to(env["device"])
     load_model_weights(policy_model, sft_ckpt, env["device"], strict=False)

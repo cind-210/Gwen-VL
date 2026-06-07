@@ -68,6 +68,7 @@ class MixedVLMSFTBatchDataset(Dataset):
             math.ceil(len(vlm_dataset) / self.vlm_per_batch),
         )
         self.local_batches = max(1, (self.global_batches + self.world_size - 1 - self.rank) // self.world_size)
+        self.start_local_batch = 0
         self.set_epoch(0)
 
     def set_epoch(self, epoch: int) -> None:
@@ -76,11 +77,14 @@ class MixedVLMSFTBatchDataset(Dataset):
         self.llm_order = torch.randperm(len(self.llm_dataset), generator=generator).tolist()
         self.vlm_order = torch.randperm(len(self.vlm_dataset), generator=generator).tolist()
 
+    def set_start_batch(self, start_batch: int) -> None:
+        self.start_local_batch = max(0, min(int(start_batch), self.local_batches))
+
     def __len__(self) -> int:
-        return self.local_batches * self.batch_size
+        return max(0, self.local_batches - self.start_local_batch) * self.batch_size
 
     def __getitem__(self, idx: int):
-        local_batch_idx = idx // self.batch_size
+        local_batch_idx = self.start_local_batch + idx // self.batch_size
         slot = idx % self.batch_size
         global_batch_idx = local_batch_idx * self.world_size + self.rank
         if slot < self.llm_per_batch:
@@ -104,7 +108,7 @@ def parse_args():
     parser.add_argument("--llm_sft_batch_fraction", type=float, default=0.5)
     parser.add_argument("--image_root", default="")
     parser.add_argument("--out_dir", default="./out")
-    parser.add_argument("--max_seq_len", type=int, default=768)
+    parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -112,6 +116,7 @@ def parse_args():
     parser.add_argument("--train_llm_mode", default="edge", choices=["edge", "full"])
     parser.add_argument("--train_llm_edge_layers", type=int, default=1)
     parser.add_argument("--vlm_rope_type", default="rope", choices=["mrope", "rope"])
+    parser.add_argument("--rotary_dim", type=int, default=64)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=-1)
@@ -148,6 +153,7 @@ def main():
     configure_vision_token_ids(config, tokenizer)
     config.vision_model_name = args.vision_model_path
     config.vlm_rope_type = args.vlm_rope_type
+    config.rotary_dim = args.rotary_dim
     checkpoint_prefix = f"vlm_sft-{config.vlm_rope_type}"
     model = GWenForCausalLM(config, vision_model_path=args.vision_model_path).to(env["device"])
     load_info = load_model_weights(model, ckpt, env["device"], strict=False)
@@ -284,20 +290,33 @@ def main():
     model.train()
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, args.epochs):
+        supports_batch_offset = hasattr(dataset, "set_start_batch")
+        if epoch == start_epoch and start_batch > 0 and not supports_batch_offset:
+            raise RuntimeError(
+                "Exact fast batch-offset resume is currently implemented for mixed VLM SFT only. "
+                "Use --data_source llm_sft_vlm_sft or resume from an epoch checkpoint."
+            )
         if sampler is not None:
+            if epoch == start_epoch and start_batch > 0:
+                raise RuntimeError(
+                    "Exact fast batch-offset resume is currently implemented for mixed VLM SFT only. "
+                    "Use --data_source llm_sft_vlm_sft or resume from an epoch checkpoint."
+                )
             sampler.set_epoch(epoch)
         elif hasattr(dataset, "set_epoch"):
             dataset.set_epoch(epoch)
+            if supports_batch_offset:
+                dataset.set_start_batch(start_batch if epoch == start_epoch else 0)
         log_loss_sum = 0.0
         log_loss_count = 0
         epoch_start = time.time()
         iter_per_epoch = len(loader)
+        total_batches_for_log = dataset.local_batches if supports_batch_offset else iter_per_epoch
         for batch_idx, batch in enumerate(loader):
-            if epoch == start_epoch and batch_idx < start_batch:
-                continue
             if args.max_steps > 0 and step >= args.max_steps:
                 break
-            sync_grad = (batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader)
+            actual_batch_idx = batch_idx + (start_batch if epoch == start_epoch and supports_batch_offset else 0)
+            sync_grad = (actual_batch_idx + 1) % args.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader)
             with maybe_no_sync(model, env["distributed"] and not sync_grad):
                 input_ids = batch["input_ids"].to(env["device"], non_blocking=True)
                 labels = batch["labels"].to(env["device"], non_blocking=True)
@@ -322,13 +341,13 @@ def main():
             current_loss = loss.item() * args.gradient_accumulation_steps
             log_loss_sum += current_loss
             log_loss_count += 1
-            current_batch = batch_idx + 1
+            current_batch = actual_batch_idx + 1
             if env["is_main"] and (current_batch % args.log_interval == 0 or current_batch == 1):
                 avg_loss = log_loss_sum / max(1, log_loss_count)
                 elapsed = time.time() - epoch_start
-                eta = (elapsed / max(1, current_batch)) * max(0, iter_per_epoch - current_batch)
+                eta = (elapsed / max(1, batch_idx + 1)) * max(0, iter_per_epoch - batch_idx - 1)
                 logger.info(
-                    f"VLM SFT Epoch [{epoch+1}/{args.epochs}] ({current_batch}/{iter_per_epoch}) "
+                    f"VLM SFT Epoch [{epoch+1}/{args.epochs}] ({current_batch}/{total_batches_for_log}) "
                     f"avg_loss={avg_loss:.4f} "
                     f"lr={optimizer.param_groups[0]['lr']:.2e} eta={format_eta(eta)} step={step}"
                 )
@@ -358,7 +377,7 @@ def main():
                         step=step,
                         epoch=epoch,
                         train_args=vars(args),
-                        extra={"batch_idx": batch_idx + 1},
+                        extra={"batch_idx": actual_batch_idx + 1},
                     )
                     logger.info(f"Saved checkpoint {step_path}")
         if env["is_main"]:

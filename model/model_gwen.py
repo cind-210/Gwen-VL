@@ -66,7 +66,7 @@ class GWenConfig:
 
     full_attention_interval: int = 4
     rope_theta: float = 10_000_000.0
-    partial_rotary_factor: float = 0.25
+    rotary_dim: int = 64
     use_cache: bool = True
 
     vision_model_name: str = "gongjy/siglip2-base-p32-256-ve"
@@ -116,15 +116,16 @@ class GWenConfig:
             raise ValueError("GWen expects equal linear key/value heads for stable GDN state layout")
         if self.linear_key_head_dim != self.linear_value_head_dim:
             raise ValueError("GWen expects equal linear key/value head dims for gated delta recurrence")
-        if int(self.head_dim * self.partial_rotary_factor) % 2 != 0:
+        if self.rotary_dim % 2 != 0:
             raise ValueError("full attention rotary dim must be even")
+        if self.rotary_dim <= 0 or self.rotary_dim > self.head_dim:
+            raise ValueError("full attention rotary dim must be in (0, head_dim]")
         if self.image_grid_size != self.image_size // self.vision_patch_size:
             raise ValueError("image_grid_size must equal image_size // vision_patch_size")
         if self.vlm_rope_type not in {"mrope", "rope"}:
             raise ValueError("vlm_rope_type must be one of: mrope, rope")
-        rotary_dim = int(self.head_dim * self.partial_rotary_factor)
-        if self.vlm_rope_type == "mrope" and rotary_dim < 32:
-            raise ValueError("M-RoPE requires full attention rotary dim >= 32")
+        if self.vlm_rope_type == "mrope" and self.rotary_dim < 64:
+            raise ValueError("M-RoPE requires full attention rotary dim >= 64")
         if self.gated_attention not in {"none", "sigmoid", "headwise", "elementwise"}:
             raise ValueError("gated_attention must be one of: none, sigmoid, headwise, elementwise")
         if self.linear_attention_backend not in {"gdn", "full"}:
@@ -178,6 +179,20 @@ class RMSNorm(nn.Module):
         return (x * (1.0 + self.weight.float())).to(dtype)
 
 
+class RMSNormGated(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x = x * self.weight.float()
+        return (x * F.silu(gate.float())).to(dtype)
+
+
 def precompute_freqs_cis(dim: int, max_len: int, theta: float) -> Tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(max_len, dtype=torch.float32)
@@ -186,9 +201,10 @@ def precompute_freqs_cis(dim: int, max_len: int, theta: float) -> Tuple[torch.Te
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def split_mrope_sections(pair_count: int) -> Tuple[int, int, int]:
@@ -220,8 +236,8 @@ def apply_rotary_pos_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if rotary_dim <= 0:
         return q, k
-    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(2)
-    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(2)
+    cos = torch.cat((cos, cos), dim=-1).unsqueeze(2)
+    sin = torch.cat((sin, sin), dim=-1).unsqueeze(2)
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
     q_rot = (q_rot.float() * cos + rotate_half(q_rot.float()) * sin).to(q.dtype)
@@ -240,7 +256,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 def causal_depthwise_conv1d(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     cache: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch, seq_len, channels = x.shape
@@ -256,7 +272,8 @@ def causal_depthwise_conv1d(
         x_cat = torch.cat([cache.to(x_t.dtype), x_t], dim=-1)
     else:
         x_cat = F.pad(x_t, (kernel - 1, 0))
-    out = F.conv1d(x_cat, weight.to(x_t.dtype), bias.to(x_t.dtype), groups=channels)
+    conv_bias = bias.to(x_t.dtype) if bias is not None else None
+    out = F.conv1d(x_cat, weight.to(x_t.dtype), conv_bias, groups=channels)
     out = out[:, :, -seq_len:]
     new_cache = x_cat[:, :, -kernel + 1 :].detach()
     return out.transpose(1, 2).contiguous(), new_cache
@@ -270,7 +287,7 @@ class FullAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_key_value_groups
-        self.rotary_dim = int(config.head_dim * config.partial_rotary_factor) 
+        self.rotary_dim = config.rotary_dim
 
         self.q_proj = nn.Linear(config.hidden_size, config.full_attention_q_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, config.full_attention_kv_dim, bias=config.attention_bias)
@@ -374,10 +391,9 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(config.hidden_size, self.num_heads, bias=config.attention_bias)
         self.in_proj_a = nn.Linear(config.hidden_size, self.num_heads, bias=config.attention_bias)
         self.conv_weight = nn.Parameter(torch.randn(channels, 1, config.linear_conv_kernel_dim) * 0.02)
-        self.conv_bias = nn.Parameter(torch.zeros(channels))
-        self.A_log = nn.Parameter(torch.empty(self.num_heads).uniform_(-0.1, 0.1))
-        self.dt_bias = nn.Parameter(torch.zeros(self.num_heads))
-        self.norm = RMSNorm(self.value_dim, config.rms_norm_eps)
+        self.A_log = nn.Parameter(torch.empty(self.num_heads).uniform_(0.0, 16.0).log_())
+        self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
+        self.norm = RMSNormGated(self.value_dim, config.rms_norm_eps)
         self.out_proj = nn.Linear(self.qkv_dim, config.hidden_size, bias=config.attention_bias)
         self.dropout = nn.Dropout(config.dropout)
         self._warned_missing_fla = False
@@ -524,7 +540,7 @@ class GatedDeltaNet(nn.Module):
         state = past_key_value.get("state") if past_key_value is not None else None
 
         qkv = self.in_proj_qkv(hidden_states)
-        qkv, new_conv_cache = causal_depthwise_conv1d(qkv, self.conv_weight, self.conv_bias, conv_cache)
+        qkv, new_conv_cache = causal_depthwise_conv1d(qkv, self.conv_weight, None, conv_cache)
         qkv = F.silu(qkv)
         q, k, v = qkv.split(self.qkv_dim, dim=-1)
         q = q.view(batch, seq_len, self.num_heads, self.head_dim)
@@ -556,7 +572,7 @@ class GatedDeltaNet(nn.Module):
             output, state = self._chunk_delta_rule(q, k, v, decay, beta, state)
         else:
             output, state = self._recurrent_delta_rule(q, k, v, decay, beta, state)
-        output = self.norm(output) * F.silu(z)
+        output = self.norm(output, z)
         output = output.reshape(batch, seq_len, self.qkv_dim)
         output = self.dropout(self.out_proj(output))
         present = {"state": state.detach(), "conv": new_conv_cache.detach()} if use_cache else None
@@ -618,7 +634,7 @@ class GWenModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([GWenDecoderLayer(config, kind) for kind in config.layer_types])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        fa_rotary = int(config.head_dim * config.partial_rotary_factor)
+        fa_rotary = config.rotary_dim
         self.mrope_sections = split_mrope_sections(fa_rotary // 2)
         cos, sin = precompute_freqs_cis(fa_rotary, config.max_position_embeddings, config.rope_theta)
         self.register_buffer("freqs_cos", cos, persistent=False)
