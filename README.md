@@ -50,15 +50,29 @@
 
 ![Gwen Architecture](./asset/GWen%20Architecture.png)
 
-Gwen-VL 首先是一个 Gwen 扩展项目，然后在此基础上加入 VLM 能力：
+Gwen-VL 由三部分组成：Gwen 文本主干、冻结的 SigLIP2 视觉塔，以及连接两者的视觉 projector。
 
-- 层结构采用 `3 × GDN + 1 × Full Attention` 的混合模式。
-- Full Attention 支持普通 Partial RoPE 和 M-RoPE；纯文本时 M-RoPE 会退化为普通 Partial RoPE，因此同一份 pretrain/LLM SFT 权重可继续用于 `rope` 或 `mrope` VLM 实验。我们这里使用mrope。
-- 视觉塔使用 `gongjy/siglip2-base-p32-256-ve`，训练时冻结，输出为 `8 × 8 = 64` 个视觉 token。
- - 使用一层MLP作为Projector ，把 SigLIP2 hidden 映射到 Gwen hidden。
-- 图像在文本侧表示为 `<|vision_start|> + 64 个 <|image_pad|> + <|vision_end|>`，视觉特征替换 `<|image_pad|>` 。
-- 如果输入没有图片则没有这些token，而非像minimind-v使用黑色图片替代。
-- VLM 主线采用 `llm_sft_vlm_sft` 混合训练：一个 batch 中同时包含 LLM SFT 与 VLM SFT 样本，默认比例 1:3。
+### 文本主干
+
+- 采用 `3 × GDN + 1 × Full Attention` 的混合结构。
+- Full Attention 支持普通 Partial RoPE 和 M-RoPE；纯文本时 M-RoPE 退化为普通 Partial RoPE，因此同一份文本预训练权重可以继续用于 `rope` 或 `mrope` VLM 实验。
+
+### 视觉接入
+
+- 视觉塔使用 `gongjy/siglip2-base-p32-256-ve`，训练时冻结。
+- 输入图像固定为 `256 × 256`，P32 patch 输出 `8 × 8 = 64` 个视觉 token。
+- Projector 使用一层 `MLP`，把 SigLIP2 hidden 映射到 Gwen hidden。
+
+### 图像 token 机制
+
+- 有图输入会插入 `<|vision_start|> + 64 个 <|image_pad|> + <|vision_end|>`。
+- 视觉特征会替换 `<|image_pad|>` 对应位置的 embedding。
+- 无图输入不会插入视觉 token，也不会使用黑图占位；这点不同于 MiniMind-V 的黑图替代方式。
+
+### 训练主线
+
+- 一个 batch 中同时包含 LLM SFT 和 VLM SFT 样本，默认比例为 `1:3`。
+- 当前实验使用 `mrope`。
 
 ## 对Gwen原项目的修改
 
