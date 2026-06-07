@@ -8,7 +8,7 @@
 
 # Gwen-VL
 
-+ Gwen-VL 是基于 [Gwen](https://github.com/juncheng0178-del/GWen) 扩展出来的轻量中文视觉语言模型实验项目,核心架构与Qwen3.5相同，但为了简单易懂忽略了许多工程细节。
++ Gwen-VL 是基于 [Gwen](https://github.com/juncheng0178-del/GWen) 扩展出来的轻量中文视觉语言模型实验项目，核心架构与Qwen3.5相同，但为了简单易懂忽略了许多工程细节。
 + 总参数约170M，可训练参数(主干)约80M，与[MiniMind](https://github.com/jingyaogong/minimind) / [MiniMind-V](https://github.com/jingyaogong/minimind-v)的参数量(60M)相当。
 
 + ⚠️ Gwen-VL对Gwen原项目的核心代码做了若干调整，故不能用Gwen原项目里的预训练模型或 sft 模型训练 vlm。
@@ -42,7 +42,7 @@
 | 名称                                                                                                                         | 说明                                 |
 | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
 | [`pretrain-rope-final_uncompiled_s.pth`](https://modelscope.cn/models/cind2100/Gwen-VL/pretrain-rope-final_uncompiled_s.pth) | 文本预训练底座                       |
-| [`vlm_sft-mrope-final_uncompiled_s.pth`](https://modelscope.cn/models/cind2100/Gwen-VL/vlm_sft-mrope-final_uncompiled_s.pth) | llm&vlm sft数据集 混合微调出来的模型 |
+| [`vlm_sft-mrope-final_uncompiled_s.pth`](https://modelscope.cn/models/cind2100/Gwen-VL/vlm_sft-mrope-final_uncompiled_s.pth) | VLM 模型 |
 
 [SigLIP2 视觉塔](https://modelscope.cn/models/gongjy/siglip2-base-p32-256-ve)不在其中，推理和训练时需要单独提供 `vision_model_path`。
 
