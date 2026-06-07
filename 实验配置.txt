@@ -1,40 +1,50 @@
-1.Pretrain
-（1）model——qwen8k_hybrid
-[2026-05-24 03:35:44] ================================================================================
-[2026-05-24 03:35:44] Gwen pretrain gwen8k_hybrid: total=80.8M embedding=6.3M body=74.5M backend=gdn gdn_kernel=fla gate=sigmoid
-[2026-05-24 03:35:44] ================================================================================
-[2026-05-24 03:35:44] Preparing dataset: path=dataset/pretrain_t2t_mini.jsonl seq_len=340 mode=lazy cache=off
-[2026-05-24 03:35:52] Dataset blocks=1270238 batch=32 accum=8 world=8 total_steps=3100 dtype=bf16
+model——gwen8k_hybrid
 
-（2）model——qwen8k_hybrid_128m
-[2026-05-24 05:35:22] ================================================================================
-[2026-05-24 05:35:22] Gwen pretrain gwen8k_hybrid_128m: total=112.5M embedding=6.3M body=106.2M backend=full gdn_kernel=auto gate=sigmoid
-[2026-05-24 05:35:22] ================================================================================
-[2026-05-24 05:35:22] Preparing dataset: path=dataset/pretrain_t2t_mini.jsonl seq_len=1024 mode=lazy cache=off
-[2026-05-24 05:35:30] Dataset blocks=1270238 batch=32 accum=1 world=8 total_steps=24805 dtype=bf16
+文本主干配置：
 
-（3）model——qwen8k_hybrid_256m
-2026-05-24 13:10:08] ================================================================================
-[2026-05-24 13:10:08] Gwen pretrain gwen8k_hybrid_256m: total=252.1M embedding=8.4M body=243.7M backend=gdn gdn_kernel=auto gate=sigmoid
-[2026-05-24 13:10:08] ================================================================================
-[2026-05-24 13:10:08] Preparing dataset: path=dataset/pretrain_t2t_mini.jsonl seq_len=1024 mode=lazy cache=off
-[2026-05-24 13:10:16] Dataset blocks=1270238 batch=32 accum=2 world=8 total_steps=7441 dtype=bf16
+- vocab_size=8192
+- hidden_size=768
+- num_hidden_layers=8
+- intermediate_size=2816
+- hidden_act=silu
+- max_position_embeddings=8192
+- rms_norm_eps=1e-6
+- tie_word_embeddings=True
 
-2.SFT
-（1）model——qwen8k_hybrid
-[2026-05-24 05:54:44] Loaded pretrain checkpoint: backend=gdn gdn_kernel=auto missing=0 unexpected=0 skipped_shape=0
-[2026-05-24 05:55:01] ================================================================================
-[2026-05-24 05:55:01] Gwen SFT gwen8k_hybrid: total=80.8M dtype=bf16
-[2026-05-24 05:55:01] ================================================================================
+Full Attention 配置：
 
-（2）model——qwen8k_hybrid_128m
-[2026-05-24 10:52:15] Loaded pretrain checkpoint: backend=gdn gdn_kernel=auto missing=0 unexpected=0 skipped_shape=0
-[2026-05-24 10:52:32] ================================================================================
-[2026-05-24 10:52:32] Gwen SFT gwen8k_hybrid_128m: total=118.0M dtype=bf16
-[2026-05-24 10:52:32] ================================================================================
+- num_attention_heads=8
+- num_key_value_heads=4
+- head_dim=96
+- attention_bias=False
+- gated_attention=sigmoid
+- full_attention_interval=4
+- rotary_dim=64
+- rope_theta=10000000.0
 
-（3）model——qwen8k_hybrid_256m
-[2026-05-25 02:54:53] Loaded pretrain checkpoint: backend=gdn gdn_kernel=auto missing=0 unexpected=0 skipped_shape=0
-[2026-05-25 02:55:10] ================================================================================
-[2026-05-25 02:55:10] Gwen SFT gwen8k_hybrid_256m: total=252.1M dtype=bf16
-[2026-05-25 02:55:10] ================================================================================
+GDN 配置：
+
+- linear_num_key_heads=8
+- linear_num_value_heads=8
+- linear_key_head_dim=96
+- linear_value_head_dim=96
+- linear_conv_kernel_dim=4
+- linear_chunk_size=64
+- linear_attention_backend=gdn
+
+VLM 配置：
+
+- vision_model_name=gongjy/siglip2-base-p32-256-ve
+- image_size=256
+- vision_patch_size=32
+- image_grid_size=8
+- image_token_count=64
+- vision_hidden_size=768
+- vlm_rope_type=mrope
+- projector=LayerNorm + Linear + GELU + Linear
+
+参数量：
+
+- 文本主干约 80.77M
+- 完整 VLM 系统约 170M
+- checkpoint 不包含冻结的 SigLIP2 视觉塔
